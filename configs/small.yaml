@@ -1,0 +1,14 @@
+# Small configuration (~500M params)
+# For quick experiments
+vocab_size: 32000
+d_model: 1024
+n_layers: 24
+attn_layer_indices: [5, 11, 17, 23]
+n_heads: 16
+n_kv_heads: 8
+d_state: 64
+d_conv: 4
+expand: 2
+headdim: 64
+chunk_size: 256
+ffn_mult: 2.667

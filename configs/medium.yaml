@@ -1,0 +1,16 @@
+# Medium configuration (~1.5B params)
+# Starting point for serious training on M4 Pro 64GB
+vocab_size: 32000
+d_model: 2048
+n_layers: 32
+attn_layer_indices: [7, 15, 23, 31]
+n_heads: 32
+n_kv_heads: 8
+d_state: 64
+d_conv: 4
+expand: 2
+headdim: 128
+chunk_size: 256
+ffn_mult: 2.667
+window_size: 4096
+full_attn_layers: [7, 31]
