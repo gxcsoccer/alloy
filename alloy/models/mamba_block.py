@@ -386,24 +386,23 @@ class MambaBlock(nn.Module):
         return self.out_proj(y)
 
     def _forward_combined(self, x, B_size, L, cache):
-        """Zamba2-style forward: combined in_proj with B, C, dt included."""
+        """Zamba2-style forward: combined in_proj with B, C, dt included.
+
+        HF Zamba2 in_proj split order: [gate(z), conv_input(x+B+C), dt]
+        Where conv_dim = d_inner + 2*d_state*n_groups
+        """
         ng = self.n_groups
-        d_bc = 2 * self.d_state * ng  # total B + C size
+        conv_dim = self.d_inner + 2 * self.d_state * ng  # x + B + C for conv
 
-        # 1. Combined projection → x, z, B, C, dt
-        proj = self.in_proj(x)  # [B, L, 2*d_inner + d_bc + n_heads]
+        # 1. Combined projection
+        proj = self.in_proj(x)  # [B, L, d_inner + conv_dim + n_heads]
 
-        # Split: x (d_inner), z (d_inner), BC (d_bc), dt (n_heads)
-        x_branch = proj[..., : self.d_inner]
-        z = proj[..., self.d_inner : 2 * self.d_inner]
-        bc_dt = proj[..., 2 * self.d_inner :]  # [B, L, d_bc + n_heads]
+        # Split matching HF order: [gate, conv_input, dt]
+        gate = proj[..., : self.d_inner]                              # z / output gate
+        conv_input = proj[..., self.d_inner : self.d_inner + conv_dim]  # x + B + C
+        dt = proj[..., self.d_inner + conv_dim :]                     # [B, L, n_heads]
 
-        # 2. Causal depthwise conv1d on [x, B, C] concatenated
-        conv_input = mx.concatenate([
-            x_branch,
-            bc_dt[..., : d_bc],  # B and C portions
-        ], axis=-1)  # [B, L, d_inner + d_bc]
-
+        # 2. Causal depthwise conv1d on conv_input
         if cache is not None and cache.conv_state is not None:
             x_padded = mx.concatenate([cache.conv_state, conv_input], axis=1)
             cache.conv_state = x_padded[:, -(self.d_conv - 1) :, :]
@@ -415,40 +414,40 @@ class MambaBlock(nn.Module):
         conv_out = self._depthwise_conv1d(x_padded, L)
         conv_out = nn.silu(conv_out)
 
-        # Split conv output back: x_conv (d_inner), B_conv (d_state*ng), C_conv (d_state*ng)
+        # Split conv output: x (d_inner), B (d_state*ng), C (d_state*ng)
         x_conv = conv_out[..., : self.d_inner]
         B_conv = conv_out[..., self.d_inner : self.d_inner + self.d_state * ng]
         C_conv = conv_out[..., self.d_inner + self.d_state * ng :]
 
-        # 3. Reshape B, C, dt for SSM
-        # B: [B, L, d_state*ng] → [B, L, n_heads, d_state] (broadcast groups)
+        # 3. Reshape B, C for SSM (expand groups to heads)
         B_param = B_conv.reshape(B_size, L, ng, self.d_state)
+        C_param = C_conv.reshape(B_size, L, ng, self.d_state)
         if ng < self.n_heads:
             reps = self.n_heads // ng
             B_param = mx.repeat(B_param, reps, axis=2)
-        C_param = C_conv.reshape(B_size, L, ng, self.d_state)
-        if ng < self.n_heads:
             C_param = mx.repeat(C_param, reps, axis=2)
 
-        # dt from the projection (not convolved)
-        dt = bc_dt[..., d_bc:]  # [B, L, n_heads]
+        # 4. Discretize: HF does hidden_states * dt first, then exp(A * dt)
         dt = nn.softplus(dt + self.dt_bias)
+        dt = mx.clip(dt, a_min=1e-4, a_max=None)  # time_step_min clamp (HF default)
         A = -mx.exp(self.A_log)
-        A_disc = mx.exp(dt * A)
 
-        # 4. Selective scan
+        # HF Mamba-2: x_heads = x * dt, then A_disc = exp(A * dt)
         x_heads = x_conv.reshape(B_size, L, self.n_heads, self.headdim)
+        x_heads = x_heads * dt[..., None]  # Scale by dt (HF: hidden_states * dt)
+        A_disc = mx.exp(A * dt)  # [B, L, n_heads]
+
+        # 5. Selective scan
         y = self._selective_scan(x_heads, A_disc, B_param, C_param, cache)
 
-        # 5. D skip connection
+        # 6. D skip connection (on dt-scaled x, matching HF)
         if self.D is not None:
             y = y + self.D[None, None, :, None] * x_heads
 
-        # 6. Inner norm (Zamba2)
+        # 7. Gate FIRST, then norm (Zamba2RMSNormGated order)
         y = y.reshape(B_size, L, self.d_inner)
+        y = y * nn.silu(gate)
         if self.norm is not None:
             y = self.norm(y)
 
-        # 7. Output gate and projection
-        y = y * nn.silu(z)
         return self.out_proj(y)
