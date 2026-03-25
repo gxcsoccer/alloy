@@ -80,6 +80,7 @@ def main():
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--lora-rank", type=int, default=64)
     parser.add_argument("--max-seq-len", type=int, default=1024)
+    parser.add_argument("--quantize", type=int, choices=[4, 8], default=None, help="Quantize base model")
     args = parser.parse_args()
 
     # Load model
@@ -91,10 +92,14 @@ def main():
     nparams_total = sum(p.size for _, p in tree_flatten(model.parameters()))
     print(f"Total params: {nparams_total / 1e9:.2f}B")
 
-    # Apply LoRA
+    # Apply LoRA BEFORE quantization (QLoRA pattern)
     print(f"Applying LoRA (rank={args.lora_rank})...")
     model.freeze()
     linear_to_lora_layers(model, lora_rank=args.lora_rank)
+
+    if args.quantize:
+        print(f"Quantizing base weights to {args.quantize}-bit (QLoRA)...")
+        nn.quantize(model, bits=args.quantize, class_predicate=lambda path, m: isinstance(m, nn.Linear) and "lora" not in path)
 
     nparams_trainable = sum(p.size for _, p in tree_flatten(model.trainable_parameters()))
     print(f"Trainable params: {nparams_trainable / 1e6:.1f}M ({100 * nparams_trainable / nparams_total:.2f}%)")
