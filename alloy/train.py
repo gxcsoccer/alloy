@@ -104,20 +104,44 @@ def main():
     lr_schedule = optim.join_schedules([warmup, cosine], [args.warmup_steps])
     optimizer = optim.AdamW(learning_rate=lr_schedule)
 
-    # Simple tokenizer placeholder for training (expects pre-tokenized or uses a
-    # basic encoding). Users should provide a proper tokenizer.
-    class CharTokenizer:
-        """Minimal character-level tokenizer for testing."""
-        def encode(self, text: str) -> list:
-            return [ord(c) % config.vocab_size for c in text]
-        def decode(self, ids: list) -> str:
-            return "".join(chr(i) for i in ids)
+    # Try to use autoresearch tokenizer + parquet data if --data points to a directory
+    # or "climbmix". Otherwise fall back to JSONL with a simple tokenizer.
+    data_path = args.data
+    use_parquet = False
 
-    tokenizer = CharTokenizer()
-    dataset = Dataset(
-        args.data, tokenizer,
-        seq_len=args.seq_len, batch_size=args.batch_size,
-    )
+    try:
+        import sys, os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        from prepare import Tokenizer, make_dataloader, MAX_SEQ_LEN
+        tokenizer = Tokenizer.from_directory()
+        use_parquet = True
+        print(f"Using climbmix data with BPE tokenizer (vocab={tokenizer.get_vocab_size()})")
+        # Override vocab_size to match tokenizer
+        if config.vocab_size != tokenizer.get_vocab_size():
+            print(f"  Adjusting vocab_size: {config.vocab_size} → {tokenizer.get_vocab_size()}")
+            config.vocab_size = tokenizer.get_vocab_size()
+            model = HybridLM(config)
+            mx.eval(model.parameters())
+            nparams = count_parameters(model)
+            print(f"  Rebuilt model: {nparams / 1e6:.1f}M parameters")
+    except (ImportError, FileNotFoundError):
+        use_parquet = False
+
+    if use_parquet:
+        train_loader = make_dataloader(tokenizer, args.batch_size, args.seq_len, "train")
+    else:
+        class CharTokenizer:
+            """Minimal character-level tokenizer for testing."""
+            def encode(self, text: str) -> list:
+                return [ord(c) % config.vocab_size for c in text]
+            def decode(self, ids: list) -> str:
+                return "".join(chr(i) for i in ids)
+
+        tokenizer = CharTokenizer()
+        dataset = Dataset(
+            args.data, tokenizer,
+            seq_len=args.seq_len, batch_size=args.batch_size,
+        )
 
     # Training loop
     print(f"Training for {args.max_steps} steps, batch_size={args.batch_size}, seq_len={args.seq_len}")
@@ -127,31 +151,42 @@ def main():
     step = 0
     tic = time.perf_counter()
 
-    while step < args.max_steps:
-        for batch in dataset:
-            loss = train_step(model, optimizer, batch)
-            mx.eval(loss, model.parameters(), optimizer.state)
-            step += 1
+    def batch_iter():
+        """Unified batch iterator for both data sources."""
+        if use_parquet:
+            while True:
+                x, y, _ = next(train_loader)
+                # Stack inputs and targets: [B, seq_len+1] -> input_ids [B, seq_len]
+                yield mx.concatenate([x[:, :1], y], axis=1)  # reconstruct full sequence
+        else:
+            while True:
+                for batch in dataset:
+                    yield batch
 
-            if step % 10 == 0:
-                toc = time.perf_counter()
-                elapsed = toc - tic
-                tps = (10 * args.batch_size * args.seq_len) / elapsed
-                print(
-                    f"step {step:>6d} | "
-                    f"loss {loss.item():.4f} | "
-                    f"lr {lr_schedule(step).item():.2e} | "
-                    f"{tps:.0f} tok/s"
-                )
-                tic = time.perf_counter()
+    for batch in batch_iter():
+        loss = train_step(model, optimizer, batch)
+        mx.eval(loss, model.parameters(), optimizer.state)
+        step += 1
 
-            if step % args.save_every == 0:
-                ckpt_path = output_dir / f"step_{step:06d}.safetensors"
-                model.save_weights(str(ckpt_path))
-                print(f"Saved checkpoint: {ckpt_path}")
+        if step % 10 == 0:
+            toc = time.perf_counter()
+            elapsed = toc - tic
+            tps = (10 * args.batch_size * args.seq_len) / elapsed
+            print(
+                f"step {step:>6d} | "
+                f"loss {loss.item():.4f} | "
+                f"lr {lr_schedule(step).item():.2e} | "
+                f"{tps:.0f} tok/s"
+            )
+            tic = time.perf_counter()
 
-            if step >= args.max_steps:
-                break
+        if step % args.save_every == 0:
+            ckpt_path = output_dir / f"step_{step:06d}.safetensors"
+            model.save_weights(str(ckpt_path))
+            print(f"Saved checkpoint: {ckpt_path}")
+
+        if step >= args.max_steps:
+            break
 
     # Final save
     ckpt_path = output_dir / "final.safetensors"
