@@ -327,8 +327,11 @@ class MambaBlock(nn.Module):
         cs = self.chunk_size
         outputs = []
 
-        use_parallel = (USE_METAL_KERNELS and cache is None
-                        and cs >= PARALLEL_SCAN_THRESHOLD)
+        # Parallel scan only for inference (no VJP for Metal scan kernel yet)
+        # During training, value_and_grad sets mx.enable_grad which we can't detect,
+        # so we check if the input requires_grad implicitly by trying cache-only mode.
+        # Simpler: only use parallel scan when cache is provided (inference mode).
+        use_parallel = False  # TODO: add VJP for parallel scan to enable during training
 
         for start in range(0, L, cs):
             end = min(start + cs, L)
