@@ -432,17 +432,22 @@ class MambaBlock(nn.Module):
         dt = mx.clip(dt, a_min=1e-4, a_max=None)  # time_step_min clamp (HF default)
         A = -mx.exp(self.A_log)
 
-        # HF Mamba-2: x_heads = x * dt, then A_disc = exp(A * dt)
+        # HF Mamba-2: D residual uses UNSCALED x, scan uses dt-scaled x
         x_heads = x_conv.reshape(B_size, L, self.n_heads, self.headdim)
-        x_heads = x_heads * dt[..., None]  # Scale by dt (HF: hidden_states * dt)
+
+        # D skip connection on UNSCALED x (before dt scaling, matching HF)
+        if self.D is not None:
+            D_residual = self.D[None, None, :, None] * x_heads
+
+        x_heads = x_heads * dt[..., None]  # Scale by dt for scan
         A_disc = mx.exp(A * dt)  # [B, L, n_heads]
 
         # 5. Selective scan
         y = self._selective_scan(x_heads, A_disc, B_param, C_param, cache)
 
-        # 6. D skip connection (on dt-scaled x, matching HF)
+        # 6. Add D residual
         if self.D is not None:
-            y = y + self.D[None, None, :, None] * x_heads
+            y = y + D_residual
 
         # 7. Gate FIRST, then norm (Zamba2RMSNormGated order)
         y = y.reshape(B_size, L, self.d_inner)
