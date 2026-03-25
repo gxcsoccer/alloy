@@ -159,11 +159,12 @@ class MambaBlock(nn.Module):
         # M[t, s] = exp(log_a_cum[t] - log_a_cum[s]) for t >= s
         # Reshape for broadcasting: [B, n_heads, cs, 1] - [B, n_heads, 1, cs]
         lac = log_a_cum.transpose(0, 2, 1)  # [B, n_heads, cs]
-        M = mx.exp(lac[:, :, :, None] - lac[:, :, None, :])  # [B, n_heads, cs, cs]
-
-        # Causal mask
-        causal = mx.tril(mx.ones((cs, cs)))
-        M = M * causal  # [B, n_heads, cs, cs]
+        # Apply causal mask BEFORE exp to avoid inf from upper-triangle
+        M_log = lac[:, :, :, None] - lac[:, :, None, :]
+        causal_mask = mx.where(
+            mx.tril(mx.ones((cs, cs))) > 0, M_log, mx.array(float("-inf"))
+        )
+        M = mx.exp(causal_mask)  # [B, n_heads, cs, cs]
 
         # h_from_input = M @ b_bar (over the time dimension)
         # b_bar: [B, cs, n_heads, d_state, headdim] -> [B, n_heads, cs, d_state*headdim]

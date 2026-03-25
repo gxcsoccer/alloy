@@ -1,0 +1,27 @@
+commit	val_bpb	memory_gb	status	description
+6ba70b9	2.165400	35.0	keep	baseline hybrid 4L (3M+1A) d384 d_state16 chunk64 bs4
+41cabeb	2.536933	35.0	discard	3x learning rates (too aggressive)
+c0b2c19	2.028173	46.6	keep	shallow+wide 2L (1M+1A) d512 — 108 steps
+1ce9f2c	1.838213	46.6	keep	halve total batch to 2^15 — 212 steps
+b156ef6	1.910234	46.6	discard	2x learning rates
+b81f982	0.000000	0.0	crash	d_model=640 OOM
+87e4b7b	1.752071	46.6	keep	halve batch to 2^14 — 423 steps
+b156ef6	1.910234	46.6	discard	2x learning rates
+b81f982	0.000000	0.0	crash	d_model=640 OOM
+cd1032c	1.999214	46.6	discard	all-mamba 2L (attention helps)
+5b55bb5	1.826457	46.6	discard	3L (2M+1A) slower steps
+320818b	1.686044	46.6	keep	batch 2^13 — 838 steps
+c93ed9c	1.707249	46.6	discard	1.5x LR
+e171fe1	1.751485	46.6	discard	d_state=32 slower
+210f7b8	1.713138	46.6	discard	d_conv=2
+97d0572	1.698401	46.6	discard	no weight decay
+e04f75c	1.687652	46.6	discard	beta1=0.8 (equal)
+0c61714	1.683892	46.6	keep	squared ReLU FFN (simpler + fewer params)
+e33e735	1.694922	46.6	discard	warmdown 0.7
+9b89b6e	1.695678	46.6	discard	2x embedding LR
+93473dd	1.677609	46.6	keep	chunk_size=128 — 884 steps
+b9ec9a9	1.683575	46.6	discard	chunk_size=256
+1cb78b4	1.675508	46.6	keep	GQA n_kv_heads=2 — 891 steps 15.4M
+abc0998	1.710097	46.6	discard	mamba headdim=128
+626b281	2.194681	46.6	discard	attention first (terrible)
+7317218	1.717969	46.6	discard	n_heads=16 head_dim=32
