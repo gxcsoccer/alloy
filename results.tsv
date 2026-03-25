@@ -2,3 +2,4 @@ commit	val_bpb	memory_gb	status	description
 6ba70b9	2.165400	35.0	keep	baseline hybrid 4L (3M+1A) d384 d_state16 chunk64 bs4
 41cabeb	2.536933	35.0	discard	3x learning rates (too aggressive)
 c0b2c19	2.028173	46.6	keep	shallow+wide 2L (1M+1A) d512 — 108 steps
+1ce9f2c	1.838213	46.6	keep	halve total batch to 2^15 — 212 steps

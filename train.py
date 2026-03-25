@@ -421,7 +421,7 @@ WINDOW_SIZE = None
 FULL_ATTN_LAYERS = []
 
 # Optimizer — conservative LRs for hybrid model stability
-TOTAL_BATCH_SIZE = 2**16
+TOTAL_BATCH_SIZE = 2**15
 DEVICE_BATCH_SIZE = 4
 MAMBA_LR = 0.004
 ATTN_LR = 0.004
