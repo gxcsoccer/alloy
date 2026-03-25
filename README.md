@@ -23,9 +23,42 @@ Alloy interleaves Mamba-2 (selective state-space) blocks with Attention blocks i
 
 ```bash
 pip install -e ".[dev]"
+pip install transformers huggingface_hub  # for pretrained models
 ```
 
-### Load a pretrained model
+### Chat with a model (easiest)
+
+```bash
+# Auto-downloads from HuggingFace, 4-bit quantized, only 1.3 GB memory
+python -m alloy.chat --model Zyphra/Zamba2-1.2B-instruct --quantize 4
+```
+
+### OpenAI-compatible API server
+
+```bash
+# Start server
+python -m alloy.serve --model Zyphra/Zamba2-1.2B-instruct --quantize 4 --port 8000
+
+# Use with any OpenAI client
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages": [{"role": "user", "content": "Hello!"}]}'
+```
+
+### Convert models
+
+```bash
+# Download + convert + quantize + save
+python -m alloy.convert_cli --model Zyphra/Zamba2-1.2B --quantize 4 --output models/zamba2-4bit
+```
+
+### Evaluate
+
+```bash
+python -m alloy.eval --model Zyphra/Zamba2-1.2B --quantize 4
+```
+
+### Python API
 
 ```python
 from alloy.convert import load_pretrained
@@ -36,22 +69,17 @@ model = load_pretrained("path/to/Zamba2-1.2B")
 model.to_bfloat16()  # optional: halve memory (6.9 GB → 3.5 GB)
 tokenizer = AutoTokenizer.from_pretrained("path/to/Zamba2-1.2B")
 text = generate(model, tokenizer, "The capital of France is", max_tokens=100)
-print(text)
-# The capital of France is Paris. It is the largest city in France and
-# the most populous city in the European Union. It is located on the
-# River Seine, in the north-central part of the country.
 ```
 
 ### Train from scratch
 
 ```bash
-python -m alloy.train \
-  --config configs/toy.yaml \
-  --data data/train.jsonl \
-  --batch-size 4 \
-  --seq-len 2048 \
-  --lr 3e-4 \
-  --max-steps 10000
+# With climbmix data (auto-detected)
+python prepare.py --num-shards 10
+python -m alloy.train --config configs/toy.yaml --data climbmix --max-steps 2000
+
+# With custom JSONL data
+python -m alloy.train --config configs/toy.yaml --data data/train.jsonl
 ```
 
 ### LoRA fine-tune
@@ -69,11 +97,8 @@ merge_lora_weights(model)  # fold adapter into base weights
 ### Autoresearch (autonomous architecture search)
 
 ```bash
-# One-time data prep
 python prepare.py --num-shards 10
-
-# Run autonomous experiment loop (5-min budget per experiment)
-python train.py > run.log 2>&1
+python train.py > run.log 2>&1  # 5-min budget per experiment
 ```
 
 See [program.md](program.md) and [docs/autoresearch-report.md](docs/autoresearch-report.md) for details.
@@ -118,19 +143,22 @@ alloy/
 │   │   └── cache.py             # MambaCache / AttentionCache / Zamba2HybridLayerCache
 │   ├── data/
 │   │   └── dataloader.py        # Streaming JSONL + packing
-│   ├── generate.py              # Autoregressive generation
-│   ├── train.py                 # Training loop + CLI
-│   ├── lora.py                  # LoRA inject / save / merge
-│   └── convert.py               # HuggingFace weight conversion
-├── configs/                      # YAML model configs
-├── tests/                        # 88 tests
+│   ├── chat.py                   # Interactive chat CLI
+│   ├── serve.py                  # OpenAI-compatible HTTP API
+│   ├── eval.py                   # Lightweight evaluation suite
+│   ├── convert_cli.py            # Model conversion CLI
+│   ├── generate.py               # Autoregressive generation
+│   ├── train.py                  # Training loop + CLI
+│   ├── lora.py                   # LoRA inject / save / merge
+│   └── convert.py                # HuggingFace weight conversion
+├── configs/                       # YAML model configs
+├── tests/                         # 88 tests
 ├── docs/
-│   ├── spec.md                  # Full project spec
-│   ├── autoresearch-report.md   # 28-experiment report
-│   └── autoresearch-integration.md
-├── prepare.py                    # Autoresearch data pipeline
-├── train.py                      # Autoresearch training script
-├── program.md                    # Autoresearch experiment protocol
+│   ├── roadmap.md                # Project roadmap
+│   ├── autoresearch-report.md    # 28-experiment report
+│   └── spec.md                   # Full project spec
+├── prepare.py                     # Autoresearch data pipeline
+├── train.py                       # Autoresearch training script
 └── pyproject.toml
 ```
 
@@ -178,15 +206,23 @@ The parallel scan kernel auto-selects based on chunk size: matmul for cs<256 (ha
 | Mode | Speed | Memory |
 |------|-------|--------|
 | No cache | 5.3 tok/s | 6.9 GB (fp32) |
-| KV + SSM cache | **24.6 tok/s** | 6.9 GB (fp32) |
-| KV + SSM cache + bf16 | **24.6 tok/s** | **3.5 GB** |
+| KV + SSM cache | 24.6 tok/s | 6.9 GB (fp32) |
+| KV + SSM cache + bf16 | 24.6 tok/s | 3.5 GB |
+| **KV + SSM cache + 4-bit** | **66.7 tok/s** | **1.3 GB** |
 
 ### Logit alignment with HuggingFace reference
 
-| Configuration | Avg top-5 diff |
-|--------------|---------------|
-| Without LoRA adapters | 0.64 |
-| **With LoRA adapters merged** | **0.23** |
+| Configuration | Avg top-5 diff | Top-1 agreement |
+|--------------|---------------|-----------------|
+| Without LoRA adapters | 0.64 | — |
+| **With LoRA adapters merged** | **0.23** | **80%** |
+
+### Benchmark (quick eval, small sample)
+
+| Benchmark | Score | Random baseline |
+|-----------|-------|-----------------|
+| MMLU (20 questions) | 80.0% | 25% |
+| HellaSwag (5 questions) | 100.0% | 25% |
 
 ## References
 
