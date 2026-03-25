@@ -24,10 +24,12 @@ def main():
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p (nucleus) sampling")
     args = parser.parse_args()
 
-    # Load model
-    print(f"Loading model from {args.model}...")
+    # Load model (supports HF model IDs with auto-download)
+    from alloy.convert_cli import download_model
+    print(f"Loading model: {args.model}...")
     t0 = time.time()
-    model = load_pretrained(args.model)
+    model_dir = download_model(args.model)
+    model = load_pretrained(model_dir)
 
     if args.quantize:
         print(f"Quantizing to {args.quantize}-bit...")
@@ -40,7 +42,7 @@ def main():
     # Load tokenizer
     try:
         from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
     except ImportError:
         print("Error: `transformers` package required for tokenizer. Install with: pip install transformers")
         sys.exit(1)
