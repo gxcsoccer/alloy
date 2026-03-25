@@ -245,3 +245,152 @@ def scan_chunk_pure_mlx(x_c, a_c, B_c, C_c, h, n_heads, headdim, d_state):
     y_chunk = y_chunk.transpose(0, 2, 1, 3)
     h_new = h_all[:, :, -1, :, :]
     return y_chunk, h_new
+
+
+# ===========================================================================
+# Kernel 4: Fused Parallel Associative Scan
+# ===========================================================================
+# Replaces the O(cs²) matmul-based scan with O(cs·log(cs)) parallel prefix.
+# Single kernel launch, shared memory, no intermediate M matrix.
+#
+# SSM recurrence: h[t] = a[t] * h[t-1] + b[t]
+# Monoid: (a1,b1) ⊕ (a2,b2) = (a1·a2, a2·b1 + b2)
+#
+# Thread layout: one threadgroup per (batch, head).
+# Each thread handles one (n, d) pair across ALL time steps.
+# Shared memory stores a[t] for all threads to read.
+# Each thread maintains its own b[t, n, d] in registers.
+
+# Parallel scan kernel: one threadgroup per (batch*head*n*d),
+# CS threads per group (one per time position).
+# Each thread stores just (a_t, b_t) — minimal register pressure.
+# Shared memory: 2 * CS floats for ping-pong scan buffers.
+
+_parallel_scan_kernel = mx.fast.metal_kernel(
+    name="parallel_scan",
+    input_names=["a_in", "b_in", "h_init"],
+    output_names=["h_all_out"],
+    source="""
+        uint t = thread_position_in_threadgroup.x;   // time position
+        uint gid = threadgroup_position_in_grid.x;
+
+        // Decode (bh, n, d) from group id
+        // gid layout: (b*H + head) * D_STATE * HEADDIM + n * HEADDIM + d
+        uint nd = gid % (D_STATE * HEADDIM);
+        uint bh = gid / (D_STATE * HEADDIM);
+        uint n = nd / HEADDIM;
+        uint d_idx = nd % HEADDIM;
+
+        if (t >= CS) return;
+
+        // Load my (a, b) values
+        float my_a = a_in[bh * CS + t];
+        float my_b = b_in[bh * CS * D_STATE * HEADDIM + t * D_STATE * HEADDIM + n * HEADDIM + d_idx];
+
+        // First position: include initial state
+        if (t == 0) {
+            float h0 = h_init[bh * D_STATE * HEADDIM + n * HEADDIM + d_idx];
+            my_b = my_a * h0 + my_b;
+        }
+
+        // Ping-pong shared memory for the scan
+        threadgroup float s_a[2 * CS];
+        threadgroup float s_b[2 * CS];
+
+        uint src = 0;  // read from s[src*CS..], write to s[(1-src)*CS..]
+        s_a[t] = my_a;
+        s_b[t] = my_b;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Hillis-Steele scan: log2(CS) steps
+        for (uint stride = 1; stride < CS; stride *= 2) {
+            uint r = src * CS;
+            uint w = (1 - src) * CS;
+
+            if (t >= stride) {
+                float a_prev = s_a[r + t - stride];
+                float b_prev = s_b[r + t - stride];
+                float a_cur = s_a[r + t];
+                float b_cur = s_b[r + t];
+                s_a[w + t] = a_prev * a_cur;
+                s_b[w + t] = a_cur * b_prev + b_cur;
+            } else {
+                s_a[w + t] = s_a[r + t];
+                s_b[w + t] = s_b[r + t];
+            }
+            src = 1 - src;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // Write scan result h[t, n, d] to global memory
+        // h_all_out: [B*H, CS, D_STATE, HEADDIM]
+        h_all_out[bh * CS * D_STATE * HEADDIM + t * D_STATE * HEADDIM + n * HEADDIM + d_idx]
+            = s_b[src * CS + t];
+    """,
+)
+
+
+def fused_parallel_scan_chunk(x_c, a_c, B_c, C_c, h, n_heads, headdim, d_state):
+    """Fused parallel scan for one chunk — O(cs·log(cs)) via Metal.
+
+    Two-kernel approach:
+    1. Parallel scan kernel → h_all[B*H, cs, N, D] (one threadgroup per b*h*n*d)
+    2. C-contraction → y[B, cs, H, D] (reuses existing kernel)
+
+    Args:
+        x_c: [B, cs, n_heads, headdim] — dt-scaled input
+        a_c: [B, cs, n_heads] — discretized decay
+        B_c: [B, cs, n_heads, d_state]
+        C_c: [B, cs, n_heads, d_state]
+        h:   [B, n_heads, d_state, headdim] — incoming state
+
+    Returns:
+        y_chunk: [B, cs, n_heads, headdim]
+        h_new:   [B, n_heads, d_state, headdim]
+    """
+    B_size, cs = x_c.shape[0], x_c.shape[1]
+
+    # Promote to float32
+    x_c = x_c.astype(mx.float32) if x_c.dtype != mx.float32 else x_c
+    B_c = B_c.astype(mx.float32) if B_c.dtype != mx.float32 else B_c
+    C_c = C_c.astype(mx.float32) if C_c.dtype != mx.float32 else C_c
+    a_c = a_c.astype(mx.float32) if a_c.dtype != mx.float32 else a_c
+
+    # b_input = B * x: [B, cs, H, N, D] → [B*H, cs, N*D]
+    b_input = B_c[..., None] * x_c[:, :, :, None, :]
+    b_flat = b_input.transpose(0, 2, 1, 3, 4).reshape(B_size * n_heads, cs, d_state * headdim)
+
+    # a: [B*H, cs]
+    a_flat = a_c.transpose(0, 2, 1).reshape(B_size * n_heads, cs)
+
+    # h_init: [B*H, N*D]
+    h_flat = h.reshape(B_size * n_heads, d_state * headdim)
+
+    # Kernel 1: Parallel scan → h_all [B*H, cs, N, D]
+    n_groups = B_size * n_heads * d_state * headdim  # one group per (b,h,n,d)
+    threads_per_group = min(cs, 256)  # one thread per time step
+
+    h_all_flat = _parallel_scan_kernel(
+        inputs=[a_flat, b_flat, h_flat],
+        template=[
+            ("T", mx.float32),
+            ("CS", cs),
+            ("N_HEADS", n_heads),
+            ("HEADDIM", headdim),
+            ("D_STATE", d_state),
+        ],
+        grid=(n_groups * threads_per_group, 1, 1),
+        threadgroup=(threads_per_group, 1, 1),
+        output_shapes=[
+            (B_size * n_heads, cs, d_state * headdim),
+        ],
+        output_dtypes=[mx.float32],
+    )[0]
+
+    # Reshape h_all to [B, n_heads, cs, d_state, headdim]
+    h_all = h_all_flat.reshape(B_size, n_heads, cs, d_state, headdim)
+
+    # Kernel 2: C-contraction → y + h_new (reuse existing)
+    y_chunk, h_new = c_contraction(C_c, h_all, n_heads, headdim, d_state)
+
+    return y_chunk, h_new

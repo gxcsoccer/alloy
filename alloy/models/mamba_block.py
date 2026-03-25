@@ -10,9 +10,11 @@ import mlx.core as mx
 import mlx.nn as nn
 
 USE_METAL_KERNELS = True
+# Auto-select parallel scan for large chunk sizes where it beats matmul
+PARALLEL_SCAN_THRESHOLD = 256  # cs >= this → use parallel scan
 
 try:
-    from alloy.models.mamba_kernels import fused_conv1d_silu, scan_chunk_metal
+    from alloy.models.mamba_kernels import fused_conv1d_silu, scan_chunk_metal, fused_parallel_scan_chunk
 
     @mx.custom_function
     def _metal_conv1d_silu(x_padded, weight, bias, L_arr):
@@ -325,19 +327,26 @@ class MambaBlock(nn.Module):
         cs = self.chunk_size
         outputs = []
 
+        use_parallel = (USE_METAL_KERNELS and cache is None
+                        and cs >= PARALLEL_SCAN_THRESHOLD)
+
         for start in range(0, L, cs):
             end = min(start + cs, L)
             chunk_len = end - start
 
-            y_chunk, h = self._scan_chunk(
-                x[:, start:end],
-                A_disc[:, start:end],
-                B[:, start:end],
-                C[:, start:end],
-                h,
-                chunk_len,
-                log_a_direct=log_a[:, start:end] if log_a is not None else None,
-            )
+            if use_parallel and chunk_len >= PARALLEL_SCAN_THRESHOLD:
+                y_chunk, h = fused_parallel_scan_chunk(
+                    x[:, start:end], A_disc[:, start:end],
+                    B[:, start:end], C[:, start:end],
+                    h, self.n_heads, self.headdim, self.d_state,
+                )
+            else:
+                y_chunk, h = self._scan_chunk(
+                    x[:, start:end], A_disc[:, start:end],
+                    B[:, start:end], C[:, start:end],
+                    h, chunk_len,
+                    log_a_direct=log_a[:, start:end] if log_a is not None else None,
+                )
             outputs.append(y_chunk)
 
         if cache is not None:
