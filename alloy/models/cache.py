@@ -65,34 +65,57 @@ class AttentionCache:
         return self
 
 
+@dataclass
+class Zamba2HybridLayerCache:
+    """Cache for a Zamba2 hybrid layer that has both mamba and attention."""
+
+    mamba_cache: MambaCache = None
+    attn_cache: AttentionCache = None
+
+    def __post_init__(self):
+        if self.mamba_cache is None:
+            self.mamba_cache = MambaCache()
+        if self.attn_cache is None:
+            self.attn_cache = AttentionCache()
+
+
 class HybridCache:
     """Unified cache manager for a hybrid model with N layers.
 
     Each layer gets either a MambaCache or AttentionCache depending on
-    its type. The layer type is determined by attn_layer_indices from config.
+    its type. For Zamba2 hybrid layers, a composite cache holds both.
 
     Args:
         n_layers: Total number of layers.
         attn_layer_indices: Which layers are attention (rest are Mamba).
+        zamba2_hybrid: If True, attention layers get Zamba2HybridLayerCache.
     """
 
-    def __init__(self, n_layers: int, attn_layer_indices: List[int]):
+    def __init__(self, n_layers: int, attn_layer_indices: List[int],
+                 zamba2_hybrid: bool = False):
         self.n_layers = n_layers
         self.attn_layer_indices = set(attn_layer_indices)
-        self.caches: List[Union[MambaCache, AttentionCache]] = []
+        self.zamba2_hybrid = zamba2_hybrid
+        self.caches: List[Union[MambaCache, AttentionCache, Zamba2HybridLayerCache]] = []
         for i in range(n_layers):
             if i in self.attn_layer_indices:
-                self.caches.append(AttentionCache())
+                if zamba2_hybrid:
+                    self.caches.append(Zamba2HybridLayerCache())
+                else:
+                    self.caches.append(AttentionCache())
             else:
                 self.caches.append(MambaCache())
 
-    def __getitem__(self, layer_idx: int) -> Union[MambaCache, AttentionCache]:
+    def __getitem__(self, layer_idx: int) -> Union[MambaCache, AttentionCache, Zamba2HybridLayerCache]:
         return self.caches[layer_idx]
 
     def reset(self) -> None:
         """Clear all cached states."""
         for i in range(self.n_layers):
             if i in self.attn_layer_indices:
-                self.caches[i] = AttentionCache()
+                if self.zamba2_hybrid:
+                    self.caches[i] = Zamba2HybridLayerCache()
+                else:
+                    self.caches[i] = AttentionCache()
             else:
                 self.caches[i] = MambaCache()

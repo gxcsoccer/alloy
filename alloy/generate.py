@@ -70,8 +70,12 @@ def stream_generate(
 
     # Prefill: process the entire prompt at once
     logits = model(prompt_tokens, cache=cache)
-    mx.eval(logits, *[c for layer_cache in cache.caches
-                       for c in _eval_cache_arrays(layer_cache)])
+    eval_arrays = [logits]
+    for layer_cache in cache.caches:
+        eval_arrays.extend(_eval_cache_arrays(layer_cache))
+    if hasattr(cache, '_original_emb') and cache._original_emb is not None:
+        eval_arrays.append(cache._original_emb)
+    mx.eval(*eval_arrays)
 
     # Sample first new token from last position
     token = sample_top_p(logits[:, -1, :], top_p, temperature)
@@ -80,8 +84,12 @@ def stream_generate(
     # Decode: generate one token at a time
     for _ in range(max_tokens - 1):
         logits = model(token, cache=cache)
-        mx.eval(logits, *[c for layer_cache in cache.caches
-                           for c in _eval_cache_arrays(layer_cache)])
+        eval_arrays = [logits]
+        for layer_cache in cache.caches:
+            eval_arrays.extend(_eval_cache_arrays(layer_cache))
+        if hasattr(cache, '_original_emb') and cache._original_emb is not None:
+            eval_arrays.append(cache._original_emb)
+        mx.eval(*eval_arrays)
         token = sample_top_p(logits[:, -1, :], top_p, temperature)
         yield token
 
@@ -119,9 +127,12 @@ def generate(
 
 def _eval_cache_arrays(layer_cache) -> list:
     """Collect non-None arrays from a cache object for mx.eval."""
-    from alloy.models.cache import AttentionCache, MambaCache
+    from alloy.models.cache import AttentionCache, MambaCache, Zamba2HybridLayerCache
     arrays = []
-    if isinstance(layer_cache, AttentionCache):
+    if isinstance(layer_cache, Zamba2HybridLayerCache):
+        arrays.extend(_eval_cache_arrays(layer_cache.mamba_cache))
+        arrays.extend(_eval_cache_arrays(layer_cache.attn_cache))
+    elif isinstance(layer_cache, AttentionCache):
         if layer_cache.keys is not None:
             arrays.extend([layer_cache.keys, layer_cache.values])
     elif isinstance(layer_cache, MambaCache):

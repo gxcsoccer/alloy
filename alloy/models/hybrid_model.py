@@ -160,6 +160,7 @@ class HybridBlock(nn.Module):
         x: mx.array,
         mask: Optional[mx.array] = None,
         cache=None,
+        original_hidden: Optional[mx.array] = None,
     ) -> mx.array:
         """Forward pass with residual connections.
 
@@ -167,18 +168,28 @@ class HybridBlock(nn.Module):
             x: Input tensor [B, L, d_model].
             mask: Attention mask (only used if this is an attention layer).
             cache: Layer-specific cache (MambaCache or AttentionCache).
+            original_hidden: Original embedding [B, L, d_model] (Zamba2 only).
 
         Returns:
             Output tensor [B, L, d_model].
         """
         if self.zamba2_hybrid:
-            # Zamba2 hybrid: mamba → linear → cat(h, x) → attention → FFN
-            h = x + self.mamba_decoder(self.mamba_norm(x))
-            h = self.linear(h)
-            # Concatenate with original input for attention (d_model → 2*d_model)
-            attn_input = mx.concatenate([h, x], axis=-1)
-            h = h + self.mixer(self.attn_norm(attn_input), mask=mask, cache=cache)
-            out = h + self.ffn(self.norm2(h))
+            # Zamba2 hybrid: shared transformer FIRST, then mamba
+            from alloy.models.cache import Zamba2HybridLayerCache
+            attn_cache = cache.attn_cache if isinstance(cache, Zamba2HybridLayerCache) else None
+            mamba_cache = cache.mamba_cache if isinstance(cache, Zamba2HybridLayerCache) else None
+
+            # 1. cat(hidden, original_emb) → norm → attention → norm → FFN
+            attn_input = mx.concatenate([x, original_hidden], axis=-1)
+            h = self.attn_norm(attn_input)
+            h = self.mixer(h, mask=mask, cache=attn_cache)
+            h = self.norm2(h)
+            h = self.ffn(h)
+            # 2. Linear projection
+            transformer_hidden = self.linear(h)
+            # 3. Mamba decoder: (hidden + transformer_hidden) → norm → mamba
+            mamba_input = x + transformer_hidden
+            out = x + self.mamba_decoder(self.mamba_norm(mamba_input), cache=mamba_cache)
             return out
         elif self.is_attention:
             h = x + self.mixer(self.norm1(x), mask=mask, cache=cache)
@@ -208,7 +219,11 @@ class HybridLM(nn.Module):
 
     def make_cache(self) -> HybridCache:
         """Create an empty HybridCache matching this model's architecture."""
-        return HybridCache(self.config.n_layers, self.config.attn_layer_indices)
+        return HybridCache(
+            self.config.n_layers,
+            self.config.attn_layer_indices,
+            zamba2_hybrid=self.config.zamba2_hybrid,
+        )
 
     def __call__(
         self,
@@ -226,9 +241,14 @@ class HybridLM(nn.Module):
         """
         x = self.embedding(input_ids)  # [B, L, d_model]
 
+        # Zamba2: original embedding for attention concatenation
+        # During prefill: full embedding [B, L, d]. During decode: just new token [B, 1, d].
+        # The attention KV cache handles the history; we only need current position's embedding.
+        original_emb = x if self.config.zamba2_hybrid else None
+
         for i, layer in enumerate(self.layers):
             layer_cache = cache[i] if cache is not None else None
-            x = layer(x, cache=layer_cache)
+            x = layer(x, cache=layer_cache, original_hidden=original_emb)
 
         x = self.norm(x)
 
