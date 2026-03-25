@@ -51,6 +51,13 @@ except ImportError:
 class MambaBlock(nn.Module):
     """Mamba-2 selective state-space block.
 
+    Supports two modes:
+    - **Alloy mode** (combined_proj=False, default): Separate in_proj (x, z)
+      and x_proj (B, C, dt) as in the original Alloy implementation.
+    - **Zamba2 mode** (combined_proj=True): Single in_proj that produces
+      x, z, B, C, dt in one projection (matching HF Zamba2 weights).
+      Also supports D skip parameter and inner RMS norm.
+
     Args:
         d_model: Model dimension.
         d_state: SSM state dimension (N).
@@ -58,6 +65,10 @@ class MambaBlock(nn.Module):
         expand: Expansion factor for inner dimension.
         headdim: Dimension per SSM head.
         chunk_size: Chunk size for parallel scan.
+        combined_proj: If True, use Zamba2-style combined projection.
+        n_groups: Number of groups for B, C projections (Zamba2 default: 1).
+        use_D: If True, include D skip connection parameter.
+        use_inner_norm: If True, apply RMS norm before output projection.
     """
 
     def __init__(
@@ -68,6 +79,10 @@ class MambaBlock(nn.Module):
         expand: int = 2,
         headdim: int = 64,
         chunk_size: int = 256,
+        combined_proj: bool = False,
+        n_groups: int = 1,
+        use_D: bool = False,
+        use_inner_norm: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
@@ -76,27 +91,50 @@ class MambaBlock(nn.Module):
         self.expand = expand
         self.headdim = headdim
         self.chunk_size = chunk_size
+        self.combined_proj = combined_proj
+        self.n_groups = n_groups
 
         d_inner = d_model * expand
         self.d_inner = d_inner
         assert d_inner % headdim == 0, "d_inner must be divisible by headdim"
         self.n_heads = d_inner // headdim
 
-        # Input projection: x -> (x_branch, z_gate)
-        self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)
+        if combined_proj:
+            # Zamba2-style: single projection for x, z, B, C, dt
+            # in_proj output: [d_inner, d_inner, d_state*n_groups, d_state*n_groups, n_heads]
+            self.d_ssm = 2 * d_state * n_groups + self.n_heads  # B + C + dt
+            proj_dim = 2 * d_inner + self.d_ssm
+            self.in_proj = nn.Linear(d_model, proj_dim, bias=False)
+            self.x_proj = None  # not used
 
-        # Causal depthwise conv1d (manual weights — MLX Conv1d lacks groups)
-        self.conv_weight = mx.random.normal((d_inner, d_conv)) * 0.02
-        self.conv_bias = mx.zeros((d_inner,))
-
-        # SSM parameter projections (input-dependent B, C, dt)
-        self.x_proj = nn.Linear(d_inner, self.n_heads * (d_state + d_state + 1), bias=False)
+            # Conv operates on x + B + C (extended)
+            conv_dim = d_inner + 2 * d_state * n_groups
+            self.conv_weight = mx.random.normal((conv_dim, d_conv)) * 0.02
+            self.conv_bias = mx.zeros((conv_dim,))
+        else:
+            # Alloy-style: separate projections
+            self.in_proj = nn.Linear(d_model, 2 * d_inner, bias=False)
+            self.conv_weight = mx.random.normal((d_inner, d_conv)) * 0.02
+            self.conv_bias = mx.zeros((d_inner,))
+            self.x_proj = nn.Linear(d_inner, self.n_heads * (d_state + d_state + 1), bias=False)
 
         # Learnable log(A) parameter — one per head (initialized to log(1) = 0)
         self.A_log = mx.zeros([self.n_heads])
 
         # dt bias
         self.dt_bias = mx.zeros([self.n_heads])
+
+        # Optional D skip connection (Zamba2)
+        if use_D:
+            self.D = mx.zeros([self.n_heads])
+        else:
+            self.D = None
+
+        # Optional inner RMS norm (Zamba2)
+        if use_inner_norm:
+            self.norm = nn.RMSNorm(d_inner)
+        else:
+            self.norm = None
 
         # Output projection
         self.out_proj = nn.Linear(d_inner, d_model, bias=False)
@@ -299,6 +337,13 @@ class MambaBlock(nn.Module):
         """
         B_size, L, _ = x.shape
 
+        if self.combined_proj:
+            return self._forward_combined(x, B_size, L, cache)
+        else:
+            return self._forward_split(x, B_size, L, cache)
+
+    def _forward_split(self, x, B_size, L, cache):
+        """Alloy-style forward: separate in_proj and x_proj."""
         # 1. Input projection → x_branch (for SSM) and z (output gate)
         xz = self.in_proj(x)  # [B, L, 2 * d_inner]
         x_branch, z = xz[..., : self.d_inner], xz[..., self.d_inner :]
@@ -310,7 +355,6 @@ class MambaBlock(nn.Module):
         else:
             x_padded = mx.pad(x_branch, [(0, 0), (self.d_conv - 1, 0), (0, 0)])
             if cache is not None:
-                # Save last d_conv-1 positions from padded sequence (includes zero-padding)
                 cache.conv_state = x_padded[:, -(self.d_conv - 1) :, :]
 
         if USE_METAL_KERNELS and cache is None:
@@ -323,14 +367,14 @@ class MambaBlock(nn.Module):
         ssm_params = self.x_proj(x_conv)  # [B, L, n_heads * (2*d_state + 1)]
         ssm_params = ssm_params.reshape(B_size, L, self.n_heads, 2 * self.d_state + 1)
 
-        B_param = ssm_params[..., : self.d_state]  # [B, L, n_heads, d_state]
+        B_param = ssm_params[..., : self.d_state]
         C_param = ssm_params[..., self.d_state : 2 * self.d_state]
-        dt = ssm_params[..., -1]  # [B, L, n_heads]
+        dt = ssm_params[..., -1]
 
-        # Discretize: A_disc = exp(A * dt), where A = -exp(A_log)
-        dt = nn.softplus(dt + self.dt_bias)  # [B, L, n_heads]
-        A = -mx.exp(self.A_log)  # [n_heads]
-        A_disc = mx.exp(dt * A)  # [B, L, n_heads]
+        # Discretize
+        dt = nn.softplus(dt + self.dt_bias)
+        A = -mx.exp(self.A_log)
+        A_disc = mx.exp(dt * A)
 
         # 4. Selective scan
         x_heads = x_conv.reshape(B_size, L, self.n_heads, self.headdim)
@@ -338,5 +382,73 @@ class MambaBlock(nn.Module):
 
         # 5. Output gate (SiLU) and projection
         y = y.reshape(B_size, L, self.d_inner)
+        y = y * nn.silu(z)
+        return self.out_proj(y)
+
+    def _forward_combined(self, x, B_size, L, cache):
+        """Zamba2-style forward: combined in_proj with B, C, dt included."""
+        ng = self.n_groups
+        d_bc = 2 * self.d_state * ng  # total B + C size
+
+        # 1. Combined projection → x, z, B, C, dt
+        proj = self.in_proj(x)  # [B, L, 2*d_inner + d_bc + n_heads]
+
+        # Split: x (d_inner), z (d_inner), BC (d_bc), dt (n_heads)
+        x_branch = proj[..., : self.d_inner]
+        z = proj[..., self.d_inner : 2 * self.d_inner]
+        bc_dt = proj[..., 2 * self.d_inner :]  # [B, L, d_bc + n_heads]
+
+        # 2. Causal depthwise conv1d on [x, B, C] concatenated
+        conv_input = mx.concatenate([
+            x_branch,
+            bc_dt[..., : d_bc],  # B and C portions
+        ], axis=-1)  # [B, L, d_inner + d_bc]
+
+        if cache is not None and cache.conv_state is not None:
+            x_padded = mx.concatenate([cache.conv_state, conv_input], axis=1)
+            cache.conv_state = x_padded[:, -(self.d_conv - 1) :, :]
+        else:
+            x_padded = mx.pad(conv_input, [(0, 0), (self.d_conv - 1, 0), (0, 0)])
+            if cache is not None:
+                cache.conv_state = x_padded[:, -(self.d_conv - 1) :, :]
+
+        conv_out = self._depthwise_conv1d(x_padded, L)
+        conv_out = nn.silu(conv_out)
+
+        # Split conv output back: x_conv (d_inner), B_conv (d_state*ng), C_conv (d_state*ng)
+        x_conv = conv_out[..., : self.d_inner]
+        B_conv = conv_out[..., self.d_inner : self.d_inner + self.d_state * ng]
+        C_conv = conv_out[..., self.d_inner + self.d_state * ng :]
+
+        # 3. Reshape B, C, dt for SSM
+        # B: [B, L, d_state*ng] → [B, L, n_heads, d_state] (broadcast groups)
+        B_param = B_conv.reshape(B_size, L, ng, self.d_state)
+        if ng < self.n_heads:
+            reps = self.n_heads // ng
+            B_param = mx.repeat(B_param, reps, axis=2)
+        C_param = C_conv.reshape(B_size, L, ng, self.d_state)
+        if ng < self.n_heads:
+            C_param = mx.repeat(C_param, reps, axis=2)
+
+        # dt from the projection (not convolved)
+        dt = bc_dt[..., d_bc:]  # [B, L, n_heads]
+        dt = nn.softplus(dt + self.dt_bias)
+        A = -mx.exp(self.A_log)
+        A_disc = mx.exp(dt * A)
+
+        # 4. Selective scan
+        x_heads = x_conv.reshape(B_size, L, self.n_heads, self.headdim)
+        y = self._selective_scan(x_heads, A_disc, B_param, C_param, cache)
+
+        # 5. D skip connection
+        if self.D is not None:
+            y = y + self.D[None, None, :, None] * x_heads
+
+        # 6. Inner norm (Zamba2)
+        y = y.reshape(B_size, L, self.d_inner)
+        if self.norm is not None:
+            y = self.norm(y)
+
+        # 7. Output gate and projection
         y = y * nn.silu(z)
         return self.out_proj(y)

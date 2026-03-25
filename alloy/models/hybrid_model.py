@@ -53,6 +53,13 @@ class HybridConfig:
     ffn_mult: float = 2.667
     window_size: Optional[int] = None
     full_attn_layers: List[int] = field(default_factory=list)
+    # Zamba2-specific options
+    combined_proj: bool = False  # Mamba combined in_proj (x+z+B+C+dt)
+    n_groups: int = 1  # B, C group count
+    use_D: bool = False  # Mamba D skip parameter
+    use_inner_norm: bool = False  # Mamba inner RMS norm
+    attn_d_model: Optional[int] = None  # Attention hidden size (if != d_model)
+    zamba2_hybrid: bool = False  # Hybrid layers have both mamba+attention
 
 
 class SwiGLU(nn.Module):
@@ -76,6 +83,11 @@ class SwiGLU(nn.Module):
 class HybridBlock(nn.Module):
     """Single hybrid layer: RMSNorm + (Mamba or Attention) + RMSNorm + FFN.
 
+    Supports two modes:
+    - **Alloy mode** (default): Each layer is EITHER Mamba OR Attention + FFN.
+    - **Zamba2 mode** (zamba2_hybrid=True on attn layers): Hybrid layers contain
+      Mamba → linear → Attention + FFN in sequence.
+
     Args:
         config: Model configuration.
         layer_idx: Index of this layer (determines Mamba vs Attention).
@@ -85,10 +97,40 @@ class HybridBlock(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.is_attention = layer_idx in config.attn_layer_indices
+        self.zamba2_hybrid = config.zamba2_hybrid and self.is_attention
 
-        self.norm1 = nn.RMSNorm(config.d_model)
+        mamba_kwargs = dict(
+            d_model=config.d_model,
+            d_state=config.d_state,
+            d_conv=config.d_conv,
+            expand=config.expand,
+            headdim=config.headdim,
+            chunk_size=config.chunk_size,
+            combined_proj=config.combined_proj,
+            n_groups=config.n_groups,
+            use_D=config.use_D,
+            use_inner_norm=config.use_inner_norm,
+        )
 
-        if self.is_attention:
+        if self.zamba2_hybrid:
+            # Zamba2: hybrid layer has mamba_decoder + shared_transformer
+            self.mamba_decoder = MambaBlock(**mamba_kwargs)
+            self.mamba_norm = nn.RMSNorm(config.d_model)  # mamba_decoder input norm
+            self.linear = nn.Linear(config.d_model, config.d_model, bias=False)
+
+            attn_dim = config.attn_d_model or config.d_model
+            self.attn_norm = nn.RMSNorm(attn_dim)
+            self.mixer = AttentionBlock(
+                d_model=attn_dim,
+                n_heads=config.n_heads,
+                n_kv_heads=config.n_kv_heads,
+            )
+            self.norm2 = nn.RMSNorm(config.d_model)
+            d_ff = int(config.d_model * config.ffn_mult)
+            d_ff = ((d_ff + 255) // 256) * 256
+            self.ffn = SwiGLU(config.d_model, d_ff)
+        elif self.is_attention:
+            self.norm1 = nn.RMSNorm(config.d_model)
             use_full = config.window_size is None or layer_idx in config.full_attn_layers
             self.mixer = AttentionBlock(
                 d_model=config.d_model,
@@ -96,21 +138,22 @@ class HybridBlock(nn.Module):
                 n_kv_heads=config.n_kv_heads,
                 window_size=None if use_full else config.window_size,
             )
+            self.norm2 = nn.RMSNorm(config.d_model)
+            d_ff = int(config.d_model * config.ffn_mult)
+            d_ff = ((d_ff + 255) // 256) * 256
+            self.ffn = SwiGLU(config.d_model, d_ff)
         else:
-            self.mixer = MambaBlock(
-                d_model=config.d_model,
-                d_state=config.d_state,
-                d_conv=config.d_conv,
-                expand=config.expand,
-                headdim=config.headdim,
-                chunk_size=config.chunk_size,
-            )
-
-        self.norm2 = nn.RMSNorm(config.d_model)
-        d_ff = int(config.d_model * config.ffn_mult)
-        # Round d_ff to nearest multiple of 256 for efficiency
-        d_ff = ((d_ff + 255) // 256) * 256
-        self.ffn = SwiGLU(config.d_model, d_ff)
+            self.norm1 = nn.RMSNorm(config.d_model)
+            self.mixer = MambaBlock(**mamba_kwargs)
+            # Zamba2 mamba-only layers have no FFN
+            if config.zamba2_hybrid:
+                self.norm2 = None
+                self.ffn = None
+            else:
+                self.norm2 = nn.RMSNorm(config.d_model)
+                d_ff = int(config.d_model * config.ffn_mult)
+                d_ff = ((d_ff + 255) // 256) * 256
+                self.ffn = SwiGLU(config.d_model, d_ff)
 
     def __call__(
         self,
@@ -128,12 +171,23 @@ class HybridBlock(nn.Module):
         Returns:
             Output tensor [B, L, d_model].
         """
-        if self.is_attention:
+        if self.zamba2_hybrid:
+            # Zamba2 hybrid: mamba → linear → cat(h, x) → attention → FFN
+            h = x + self.mamba_decoder(self.mamba_norm(x))
+            h = self.linear(h)
+            # Concatenate with original input for attention (d_model → 2*d_model)
+            attn_input = mx.concatenate([h, x], axis=-1)
+            h = h + self.mixer(self.attn_norm(attn_input), mask=mask, cache=cache)
+            out = h + self.ffn(self.norm2(h))
+            return out
+        elif self.is_attention:
             h = x + self.mixer(self.norm1(x), mask=mask, cache=cache)
         else:
             h = x + self.mixer(self.norm1(x), cache=cache)
-        out = h + self.ffn(self.norm2(h))
-        return out
+        if self.ffn is not None:
+            out = h + self.ffn(self.norm2(h))
+            return out
+        return h
 
 
 class HybridLM(nn.Module):

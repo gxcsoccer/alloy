@@ -210,24 +210,47 @@ def convert_jamba(model_path: str) -> Tuple[HybridConfig, Dict[str, mx.array]]:
 # ---------------------------------------------------------------------------
 # Zamba2 (Zyphra)
 # ---------------------------------------------------------------------------
-# HF Zamba2 layer keys:
+# Real Zamba2-1.2B HF weight structure:
+#
+# Global:
 #   model.embed_tokens.weight
-#   model.layers.{i}.mamba_block.{in_proj,conv1d,x_proj,dt_proj,out_proj}
-#   model.layers.{i}.mamba_block.A_log
-#   model.layers.{i}.attention.{q,k,v,o}_proj.weight   (shared blocks)
-#   model.layers.{i}.mlp.{gate,up,down}_proj.weight     (shared MLP)
+#   model.final_layernorm.weight
+#
+# Mamba-only layers (e.g., layer 0):
 #   model.layers.{i}.input_layernorm.weight
-#   model.layers.{i}.post_attention_layernorm.weight
-#   model.norm.weight
-#   lm_head.weight
+#   model.layers.{i}.mamba.in_proj.weight       [d_inner*2 + d_bc + n_heads, d_model]
+#   model.layers.{i}.mamba.conv1d.weight         [d_inner + d_bc, 1, d_conv]
+#   model.layers.{i}.mamba.conv1d.bias           [d_inner + d_bc]
+#   model.layers.{i}.mamba.A_log                 [n_mamba_heads]
+#   model.layers.{i}.mamba.D                     [n_mamba_heads]
+#   model.layers.{i}.mamba.dt_bias               [n_mamba_heads]
+#   model.layers.{i}.mamba.norm.weight           [d_inner]
+#   model.layers.{i}.mamba.out_proj.weight       [d_model, d_inner]
+#   (no separate x_proj — B, C, dt are in in_proj)
+#   (no FFN for mamba-only layers)
+#
+# Hybrid layers (e.g., layer 5):
+#   model.layers.{i}.mamba_decoder.input_layernorm.weight
+#   model.layers.{i}.mamba_decoder.mamba.{in_proj,conv1d,A_log,D,dt_bias,norm,out_proj}
+#   model.layers.{i}.linear.weight               [d_model, d_model]
+#   model.layers.{i}.shared_transformer.input_layernorm.weight   [attn_dim]
+#   model.layers.{i}.shared_transformer.self_attn.{q,k,v,o}_proj.weight
+#   model.layers.{i}.shared_transformer.pre_ff_layernorm.weight  [d_model]
+#   model.layers.{i}.shared_transformer.feed_forward.gate_up_proj.weight  [2*ffn_dim, d_model]
+#   model.layers.{i}.shared_transformer.feed_forward.down_proj.weight     [d_model, ffn_dim]
+#   + adapter_list weights (LoRA, ignored for now)
 
 
 def convert_zamba(model_path: str) -> Tuple[HybridConfig, Dict[str, mx.array]]:
     """Convert Zamba2 model weights to Alloy format.
 
-    Zamba2 uses Mamba-2 (matching our architecture) with shared attention
-    blocks. Shared attention weights are duplicated into each attention
-    layer for simplicity.
+    Handles the real Zamba2 weight structure including:
+    - Combined in_proj (x + z + B + C + dt)
+    - Conv1d on extended input (x + B + C)
+    - D skip connection, inner RMS norm
+    - Hybrid layers with mamba_decoder + shared_transformer
+    - Fused gate_up_proj (split into w1 + w3)
+    - Adapter weights (LoRA) are ignored
 
     Args:
         model_path: Path to HuggingFace Zamba2 model directory.
@@ -243,17 +266,19 @@ def convert_zamba(model_path: str) -> Tuple[HybridConfig, Dict[str, mx.array]]:
     n_heads = hf_cfg.get("num_attention_heads", 32)
     n_kv_heads = hf_cfg.get("num_key_value_heads", n_heads)
 
-    # Zamba2 specifies layer types explicitly
     block_types = hf_cfg.get("layers_block_type", [])
     attn_indices = [i for i, t in enumerate(block_types) if t == "hybrid"]
 
     d_state = hf_cfg.get("mamba_d_state", 64)
     d_conv = hf_cfg.get("mamba_d_conv", 4)
     expand = hf_cfg.get("mamba_expand", 2)
+    n_groups = hf_cfg.get("mamba_ngroups", 1)
     d_inner = d_model * expand
-    n_mamba_heads = hf_cfg.get("n_mamba_heads", 8)
+    n_mamba_heads = hf_cfg.get("n_mamba_heads", d_inner // 64)
     headdim = d_inner // n_mamba_heads if n_mamba_heads else 64
     chunk_size = hf_cfg.get("chunk_size", 256)
+    ffn_dim = hf_cfg.get("intermediate_size", int(d_model * 4))
+    attn_d_model = hf_cfg.get("attention_hidden_size", d_model)
 
     config = HybridConfig(
         vocab_size=hf_cfg["vocab_size"],
@@ -267,7 +292,13 @@ def convert_zamba(model_path: str) -> Tuple[HybridConfig, Dict[str, mx.array]]:
         expand=expand,
         headdim=headdim,
         chunk_size=chunk_size,
-        ffn_mult=hf_cfg.get("intermediate_size", int(d_model * 2.667)) / d_model,
+        ffn_mult=ffn_dim / d_model,
+        combined_proj=True,
+        n_groups=n_groups,
+        use_D=True,
+        use_inner_norm=True,
+        attn_d_model=attn_d_model,
+        zamba2_hybrid=True,
     )
 
     alloy_weights = {}
@@ -276,60 +307,117 @@ def convert_zamba(model_path: str) -> Tuple[HybridConfig, Dict[str, mx.array]]:
     _map(alloy_weights, hf_weights, "model.embed_tokens.weight", "embedding.weight")
 
     # Final norm
-    _map(alloy_weights, hf_weights, "model.norm.weight", "norm.weight")
+    _map(alloy_weights, hf_weights, "model.final_layernorm.weight", "norm.weight")
 
-    # Per-layer
+    # Find the first hybrid layer that has shared_transformer weights
+    shared_layer = None
+    for i in attn_indices:
+        if any(f"model.layers.{i}.shared_transformer" in k for k in hf_weights):
+            shared_layer = i
+            break
+
     for i in range(n_layers):
         hf_pre = f"model.layers.{i}"
         al_pre = f"layers.{i}"
 
-        # Norms
-        _map(alloy_weights, hf_weights,
-             f"{hf_pre}.input_layernorm.weight", f"{al_pre}.norm1.weight")
-        _map_optional(alloy_weights, hf_weights,
-                      f"{hf_pre}.post_attention_layernorm.weight", f"{al_pre}.norm2.weight")
-
         if i in attn_indices:
-            # Attention (may be shared in HF, we store per-layer)
+            # === Zamba2 hybrid layer: mamba_decoder + shared_transformer ===
+
+            # Mamba decoder sub-block
+            _convert_zamba_mamba_block(
+                alloy_weights, hf_weights,
+                hf_prefix=f"{hf_pre}.mamba_decoder.mamba",
+                al_prefix=f"{al_pre}.mamba_decoder",
+            )
+            # Mamba decoder input norm
+            _map(alloy_weights, hf_weights,
+                 f"{hf_pre}.mamba_decoder.input_layernorm.weight",
+                 f"{al_pre}.mamba_norm.weight")
+
+            # Linear projection between mamba and attention
+            _map(alloy_weights, hf_weights,
+                 f"{hf_pre}.linear.weight",
+                 f"{al_pre}.linear.weight")
+
+            # Shared transformer: duplicate from the source layer
+            src = f"model.layers.{shared_layer}" if shared_layer is not None else hf_pre
+
+            # Attention projections (shared, duplicated per-layer)
+            attn_pre = f"{src}.shared_transformer.self_attn"
             for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
                 _map(alloy_weights, hf_weights,
-                     f"{hf_pre}.attention.{proj}.weight", f"{al_pre}.mixer.{proj}.weight")
+                     f"{attn_pre}.{proj}.weight",
+                     f"{al_pre}.mixer.{proj}.weight")
 
-            # FFN for hybrid layers
-            for hf_name, al_name in [("gate_proj", "w1"), ("down_proj", "w2"), ("up_proj", "w3")]:
-                _map_optional(alloy_weights, hf_weights,
-                              f"{hf_pre}.mlp.{hf_name}.weight", f"{al_pre}.ffn.{al_name}.weight")
+            # Attention norm (shared)
+            _map(alloy_weights, hf_weights,
+                 f"{src}.shared_transformer.input_layernorm.weight",
+                 f"{al_pre}.attn_norm.weight")
+
+            # FFN: fused gate_up_proj → split into w1 (gate) + w3 (up)
+            ffn_pre = f"{src}.shared_transformer.feed_forward"
+            gate_up_key = f"{ffn_pre}.gate_up_proj.weight"
+            if gate_up_key in hf_weights:
+                gate_up = hf_weights[gate_up_key]  # [2 * ffn_dim, d_model]
+                half = gate_up.shape[0] // 2
+                alloy_weights[f"{al_pre}.ffn.w1.weight"] = gate_up[:half]  # gate
+                alloy_weights[f"{al_pre}.ffn.w3.weight"] = gate_up[half:]  # up
+            _map_optional(alloy_weights, hf_weights,
+                          f"{ffn_pre}.down_proj.weight",
+                          f"{al_pre}.ffn.w2.weight")
+
+            # Pre-FFN norm (shared)
+            _map_optional(alloy_weights, hf_weights,
+                          f"{src}.shared_transformer.pre_ff_layernorm.weight",
+                          f"{al_pre}.norm2.weight")
+
         else:
-            # Mamba2 block
+            # === Mamba-only layer ===
             _map(alloy_weights, hf_weights,
-                 f"{hf_pre}.mamba_block.in_proj.weight", f"{al_pre}.mixer.in_proj.weight")
-            _map(alloy_weights, hf_weights,
-                 f"{hf_pre}.mamba_block.x_proj.weight", f"{al_pre}.mixer.x_proj.weight")
-            _map(alloy_weights, hf_weights,
-                 f"{hf_pre}.mamba_block.out_proj.weight", f"{al_pre}.mixer.out_proj.weight")
-            _map(alloy_weights, hf_weights,
-                 f"{hf_pre}.mamba_block.A_log", f"{al_pre}.mixer.A_log")
-            _map_optional(alloy_weights, hf_weights,
-                          f"{hf_pre}.mamba_block.dt_bias", f"{al_pre}.mixer.dt_bias")
+                 f"{hf_pre}.input_layernorm.weight",
+                 f"{al_pre}.norm1.weight")
 
-            # Conv1d
-            conv_key = f"{hf_pre}.mamba_block.conv1d.weight"
-            if conv_key in hf_weights:
-                w = hf_weights[conv_key]
-                if w.ndim == 3:
-                    w = w.squeeze(1)
-                alloy_weights[f"{al_pre}.mixer.conv_weight"] = w
-            _map_optional(alloy_weights, hf_weights,
-                          f"{hf_pre}.mamba_block.conv1d.bias", f"{al_pre}.mixer.conv_bias")
-
-        # FFN for mamba layers (if present)
-        if i not in attn_indices:
-            for hf_name, al_name in [("gate_proj", "w1"), ("down_proj", "w2"), ("up_proj", "w3")]:
-                _map_optional(alloy_weights, hf_weights,
-                              f"{hf_pre}.feed_forward.{hf_name}.weight",
-                              f"{al_pre}.ffn.{al_name}.weight")
+            _convert_zamba_mamba_block(
+                alloy_weights, hf_weights,
+                hf_prefix=f"{hf_pre}.mamba",
+                al_prefix=f"{al_pre}.mixer",
+            )
 
     return config, alloy_weights
+
+
+def _convert_zamba_mamba_block(
+    alloy_weights: dict,
+    hf_weights: dict,
+    hf_prefix: str,
+    al_prefix: str,
+) -> None:
+    """Convert a single Zamba2 mamba block's weights.
+
+    Handles in_proj, conv1d (squeeze), A_log, D, dt_bias, norm, out_proj.
+    """
+    _map(alloy_weights, hf_weights,
+         f"{hf_prefix}.in_proj.weight", f"{al_prefix}.in_proj.weight")
+    _map(alloy_weights, hf_weights,
+         f"{hf_prefix}.out_proj.weight", f"{al_prefix}.out_proj.weight")
+    _map(alloy_weights, hf_weights,
+         f"{hf_prefix}.A_log", f"{al_prefix}.A_log")
+    _map_optional(alloy_weights, hf_weights,
+                  f"{hf_prefix}.D", f"{al_prefix}.D")
+    _map_optional(alloy_weights, hf_weights,
+                  f"{hf_prefix}.dt_bias", f"{al_prefix}.dt_bias")
+    _map_optional(alloy_weights, hf_weights,
+                  f"{hf_prefix}.norm.weight", f"{al_prefix}.norm.weight")
+
+    # Conv1d: [conv_dim, 1, d_conv] → [conv_dim, d_conv]
+    conv_key = f"{hf_prefix}.conv1d.weight"
+    if conv_key in hf_weights:
+        w = hf_weights[conv_key]
+        if w.ndim == 3:
+            w = w.squeeze(1)
+        alloy_weights[f"{al_prefix}.conv_weight"] = w
+    _map_optional(alloy_weights, hf_weights,
+                  f"{hf_prefix}.conv1d.bias", f"{al_prefix}.conv_bias")
 
 
 # ---------------------------------------------------------------------------
