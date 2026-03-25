@@ -21,6 +21,36 @@ from mlx.utils import tree_flatten, tree_map
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
 
+try:
+    from alloy.models.mamba_kernels import fused_conv1d_silu
+
+    @mx.custom_function
+    def _metal_conv1d_silu(x_padded, weight, bias, L_arr):
+        return fused_conv1d_silu(x_padded, weight, bias, int(L_arr.item()))
+
+    @_metal_conv1d_silu.vjp
+    def _metal_conv1d_vjp(primals, cotangent, output):
+        x_padded, weight, bias, L_arr = primals
+        dy = cotangent
+        L = int(L_arr.item())
+        d_conv = weight.shape[1]
+        out_pre = mx.zeros_like(x_padded[:, :L, :])
+        for k in range(d_conv):
+            out_pre = out_pre + x_padded[:, k : k + L, :] * weight[:, k]
+        out_pre = out_pre + bias
+        sig = mx.sigmoid(out_pre)
+        dconv = dy * sig * (1 + out_pre * (1 - sig))
+        dx_padded = mx.zeros_like(x_padded)
+        dweight = mx.zeros_like(weight)
+        for k in range(d_conv):
+            dx_padded = dx_padded.at[:, k : k + L, :].add(dconv * weight[:, k])
+            dweight = dweight.at[:, k].add((dconv * x_padded[:, k : k + L, :]).sum(axis=(0, 1)))
+        return dx_padded, dweight, dconv.sum(axis=(0, 1)), mx.array(0)
+
+    USE_METAL = True
+except ImportError:
+    USE_METAL = False
+
 # ===========================================================================
 # Model Architecture — Hybrid SSM-Attention (Alloy)
 # ===========================================================================
@@ -137,8 +167,11 @@ class MambaBlock(nn.Module):
         x_branch, z = xz[..., : self.d_inner], xz[..., self.d_inner :]
 
         x_padded = mx.pad(x_branch, [(0, 0), (self.d_conv - 1, 0), (0, 0)])
-        x_conv = self._depthwise_conv1d(x_padded, L)
-        x_conv = nn.silu(x_conv)
+        if USE_METAL:
+            x_conv = _metal_conv1d_silu(x_padded, self.conv_weight, self.conv_bias, mx.array(L))
+        else:
+            x_conv = self._depthwise_conv1d(x_padded, L)
+            x_conv = nn.silu(x_conv)
 
         ssm_params = self.x_proj(x_conv)
         ssm_params = ssm_params.reshape(B_size, L, self.n_heads, 2 * self.d_state + 1)
