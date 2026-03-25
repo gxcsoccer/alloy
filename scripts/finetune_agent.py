@@ -25,6 +25,7 @@ from alloy.lora import linear_to_lora_layers
 def load_data(path, tokenizer, max_seq_len=2048):
     """Load JSONL messages and convert to token sequences."""
     examples = []
+    skipped = 0
     with open(path) as f:
         for line in f:
             item = json.loads(line)
@@ -32,17 +33,28 @@ def load_data(path, tokenizer, max_seq_len=2048):
 
             # Format using chat template
             if hasattr(tokenizer, 'apply_chat_template'):
-                text = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=False,
-                )
+                try:
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=False,
+                    )
+                except Exception:
+                    skipped += 1
+                    continue
             else:
                 text = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
 
             ids = tokenizer.encode(text)
+            # Skip examples that are too long (prevents OOM spikes)
             if len(ids) > max_seq_len:
-                ids = ids[:max_seq_len]
+                skipped += 1
+                continue
+            if len(ids) < 10:
+                skipped += 1
+                continue
             examples.append(ids)
 
+    if skipped:
+        print(f"  Skipped {skipped} examples (too long/short/error)")
     return examples
 
 
@@ -133,7 +145,7 @@ def main():
             mx.eval(loss, model.parameters(), optimizer.state)
             step += 1
 
-            if step % 10 == 0:
+            if step % 1 == 0:
                 toc = time.perf_counter()
                 elapsed = toc - tic
                 print(f"step {step:>4d} | loss {loss.item():.4f} | {elapsed:.1f}s")
