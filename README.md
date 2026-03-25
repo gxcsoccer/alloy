@@ -8,14 +8,15 @@ Alloy interleaves Mamba-2 (selective state-space) blocks with Attention blocks i
 
 ## Features
 
-- **Mamba-2 block** — selective scan with chunked parallel computation, Metal-accelerated conv1d (8x speedup)
+- **Mamba-2 block** — selective scan with chunked parallel computation + fused Metal parallel scan kernel
 - **Attention block** — MHA / GQA / sliding-window, with RoPE
 - **HybridLM** — configurable interleaved architecture, supports both Alloy-native and Zamba2 modes
 - **Training** — AdamW + cosine schedule, streaming JSONL dataloader with packing
 - **LoRA** — freeze-and-inject adapter, save/load/merge
 - **Generation** — autoregressive decoding with KV + SSM cache, top-p sampling, streaming output
-- **Weight conversion** — load Zamba2 / Jamba weights from HuggingFace (verified on Zamba2-1.2B)
-- **Metal kernels** — fused conv1d+SiLU kernel for training and inference acceleration
+- **Weight conversion** — load Zamba2 / Jamba weights from HuggingFace (verified on Zamba2-1.2B, with LoRA adapter merging)
+- **Metal kernels** — fused conv1d+SiLU (8.3x), parallel associative scan (2.2x at cs=512)
+- **bfloat16** — mixed precision support (2x memory reduction, scan internals auto-promote to fp32)
 - **Autoresearch** — autonomous architecture search harness (28 experiments, 22.6% improvement)
 
 ## Quickstart
@@ -32,10 +33,13 @@ from alloy.generate import generate
 from transformers import AutoTokenizer
 
 model = load_pretrained("path/to/Zamba2-1.2B")
+model.to_bfloat16()  # optional: halve memory (6.9 GB → 3.5 GB)
 tokenizer = AutoTokenizer.from_pretrained("path/to/Zamba2-1.2B")
 text = generate(model, tokenizer, "The capital of France is", max_tokens=100)
 print(text)
-# The capital of France is Paris. It is the largest city in France and...
+# The capital of France is Paris. It is the largest city in France and
+# the most populous city in the European Union. It is located on the
+# River Seine, in the north-central part of the country.
 ```
 
 ### Train from scratch
@@ -159,11 +163,30 @@ x → shared_transformer ──────────────────�
 
 ## Performance
 
+### Metal kernel acceleration
+
 | Operation | Pure MLX | Metal Kernel | Speedup |
 |-----------|----------|-------------|---------|
 | Conv1d + SiLU | 3.6ms | 0.4ms | **8.3x** |
-| Zamba2-1.2B generation | 5.3 tok/s | — | — |
-| Zamba2-1.2B with KV cache | 24.6 tok/s | — | **4.6x** |
+| Scan chunk (cs=512) | 11.6ms | 5.2ms | **2.2x** |
+| MambaBlock forward | 36.7ms | 26.7ms | **1.38x** |
+
+The parallel scan kernel auto-selects based on chunk size: matmul for cs<256 (hardware matrix engines optimal), Metal parallel scan for cs≥256 (O(cs·log cs) beats O(cs²)).
+
+### Zamba2-1.2B inference
+
+| Mode | Speed | Memory |
+|------|-------|--------|
+| No cache | 5.3 tok/s | 6.9 GB (fp32) |
+| KV + SSM cache | **24.6 tok/s** | 6.9 GB (fp32) |
+| KV + SSM cache + bf16 | **24.6 tok/s** | **3.5 GB** |
+
+### Logit alignment with HuggingFace reference
+
+| Configuration | Avg top-5 diff |
+|--------------|---------------|
+| Without LoRA adapters | 0.64 |
+| **With LoRA adapters merged** | **0.23** |
 
 ## References
 
