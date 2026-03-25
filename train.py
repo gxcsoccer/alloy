@@ -405,12 +405,12 @@ class AdamW:
 # Hyperparameters (edit these to experiment)
 # ===========================================================================
 
-# Architecture — start small for fast compilation, scale up once working
-DEPTH = 4
-D_MODEL = 384
-ATTN_LAYER_INDICES = [3]  # Mamba:Attention = 3:1
-N_HEADS = 6
-N_KV_HEADS = 6
+# Architecture — shallow+wide: fewer layers = faster steps = more updates
+DEPTH = 2
+D_MODEL = 512
+ATTN_LAYER_INDICES = [1]  # 1 Mamba + 1 Attention
+N_HEADS = 8
+N_KV_HEADS = 8
 D_STATE = 16
 D_CONV = 4
 EXPAND = 2
