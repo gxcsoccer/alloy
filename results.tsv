@@ -6,3 +6,8 @@ c0b2c19	2.028173	46.6	keep	shallow+wide 2L (1M+1A) d512 — 108 steps
 b156ef6	1.910234	46.6	discard	2x learning rates
 b81f982	0.000000	0.0	crash	d_model=640 OOM
 87e4b7b	1.752071	46.6	keep	halve batch to 2^14 — 423 steps
+b156ef6	1.910234	46.6	discard	2x learning rates
+b81f982	0.000000	0.0	crash	d_model=640 OOM
+cd1032c	1.999214	46.6	discard	all-mamba 2L (attention helps)
+5b55bb5	1.826457	46.6	discard	3L (2M+1A) slower steps
+320818b	1.686044	46.6	keep	batch 2^13 — 838 steps
