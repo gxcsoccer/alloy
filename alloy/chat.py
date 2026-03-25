@@ -63,7 +63,15 @@ def main():
         if not prompt.strip():
             continue
 
-        ids = tokenizer.encode(prompt)
+        # Apply chat template if available (for instruct models)
+        messages = [{"role": "user", "content": prompt}]
+        if hasattr(tokenizer, 'apply_chat_template'):
+            formatted = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+            ids = tokenizer.encode(formatted)
+        else:
+            ids = tokenizer.encode(prompt)
         prompt_ids = mx.array([ids])
         tokens = list(ids)
 

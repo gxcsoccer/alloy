@@ -115,17 +115,18 @@ class AlloyHandler(BaseHTTPRequestHandler):
         top_p = body.get("top_p", 0.9)
         stream = body.get("stream", False)
 
-        # Build prompt from messages
-        prompt = ""
-        for msg in messages:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "system":
-                prompt += f"{content}\n\n"
-            elif role == "user":
-                prompt += f"{content}"
-            elif role == "assistant":
-                prompt += f"{content}"
+        # Build prompt using tokenizer's chat template if available
+        if hasattr(_tokenizer, 'apply_chat_template'):
+            prompt = _tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            )
+        else:
+            # Fallback: simple concatenation
+            prompt = ""
+            for msg in messages:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                prompt += f"{content}\n"
 
         request_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
         t0 = time.time()
