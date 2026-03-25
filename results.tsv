@@ -17,3 +17,6 @@ e171fe1	1.751485	46.6	discard	d_state=32 slower
 97d0572	1.698401	46.6	discard	no weight decay
 e04f75c	1.687652	46.6	discard	beta1=0.8 (equal)
 0c61714	1.683892	46.6	keep	squared ReLU FFN (simpler + fewer params)
+e33e735	1.694922	46.6	discard	warmdown 0.7
+9b89b6e	1.695678	46.6	discard	2x embedding LR
+93473dd	1.677609	46.6	keep	chunk_size=128 — 884 steps
