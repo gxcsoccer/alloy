@@ -461,7 +461,9 @@ class MambaBlock(nn.Module):
 
         # 4. Discretize: HF does hidden_states * dt first, then exp(A * dt)
         dt = nn.softplus(dt + self.dt_bias)
-        dt = mx.clip(dt, a_min=1e-4, a_max=None)  # time_step_min clamp (HF default)
+        # Nemotron-H: time_step_limit=[0.0, inf], no clamping needed
+        # Zamba2: time_step_min=0.0001
+        # Only clamp if not Nemotron-H style (where time_step_limit allows 0)
         A = -mx.exp(self.A_log)
 
         # HF Mamba-2: D residual uses UNSCALED x, scan uses dt-scaled x
