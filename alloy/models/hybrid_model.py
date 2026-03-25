@@ -229,6 +229,26 @@ class HybridLM(nn.Module):
         self.load_weights(params, strict=False)
         return self
 
+    def quantize(self, bits: int = 4, group_size: int = 64):
+        """Quantize model weights for reduced memory and faster inference.
+
+        Args:
+            bits: Bits per weight (4 or 8). Default: 4.
+            group_size: Quantization group size. Default: 64.
+
+        Returns:
+            self (quantized in-place).
+        """
+        # Quantize Linear layers only. Skip Embedding (weight-tied LM head
+        # needs raw weight for x @ embedding.weight.T) and Mamba scalars.
+        def predicate(path, module):
+            if isinstance(module, nn.Linear):
+                return True
+            return False
+
+        nn.quantize(self, group_size=group_size, bits=bits, class_predicate=predicate)
+        return self
+
     def make_cache(self) -> HybridCache:
         """Create an empty HybridCache matching this model's architecture."""
         return HybridCache(
