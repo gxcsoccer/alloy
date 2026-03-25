@@ -203,16 +203,19 @@ class MambaBlock(nn.Module):
         C_c: mx.array,
         h: mx.array,
         cs: int,
+        log_a_direct: mx.array = None,
     ) -> tuple:
         """Process one chunk of the selective scan using parallel matmul.
 
         Args:
             x_c: [B, cs, n_heads, headdim]
-            a_c: [B, cs, n_heads] — decay factors
+            a_c: [B, cs, n_heads] — decay factors (exp(A*dt))
             B_c: [B, cs, n_heads, d_state]
             C_c: [B, cs, n_heads, d_state]
             h:   [B, n_heads, d_state, headdim] — incoming state
             cs:  chunk size (may differ from self.chunk_size for last chunk)
+            log_a_direct: [B, cs, n_heads] — if provided, use directly as log(A_disc)
+                to avoid exp→log roundtrip precision loss.
 
         Returns:
             (y_chunk, h_new) where y_chunk: [B, cs, n_heads, headdim],
@@ -227,8 +230,10 @@ class MambaBlock(nn.Module):
         b_bar = B_c[..., None] * x_c[:, :, :, None, :]
 
         # Build transfer matrix in log-space for numerical stability
-        # log(a): a_c is already exp(A*dt), A<0 so 0 < a_c <= 1, log is safe
-        log_a = mx.log(mx.clip(a_c, a_min=1e-10, a_max=None))  # [B, cs, n_heads]
+        if log_a_direct is not None:
+            log_a = log_a_direct  # A*dt directly, avoids exp→log roundtrip
+        else:
+            log_a = mx.log(mx.clip(a_c, a_min=1e-10, a_max=None))
         log_a_cum = mx.cumsum(log_a, axis=1)  # [B, cs, n_heads]
 
         # M[t, s] = exp(log_a_cum[t] - log_a_cum[s]) for t >= s
@@ -273,6 +278,7 @@ class MambaBlock(nn.Module):
         B: mx.array,
         C: mx.array,
         cache=None,
+        log_a: mx.array = None,
     ) -> mx.array:
         """Chunked parallel selective scan.
 
@@ -287,6 +293,8 @@ class MambaBlock(nn.Module):
             B: Input-dependent B, shape [B, L, n_heads, d_state].
             C: Input-dependent C, shape [B, L, n_heads, d_state].
             cache: Optional MambaCache to read/write SSM state.
+            log_a: If provided, [B, L, n_heads] log-space decay (A*dt) to
+                avoid exp→log roundtrip.
 
         Returns:
             Output per head, shape [B, L, n_heads, headdim].
@@ -317,6 +325,7 @@ class MambaBlock(nn.Module):
                 C[:, start:end],
                 h,
                 chunk_len,
+                log_a_direct=log_a[:, start:end] if log_a is not None else None,
             )
             outputs.append(y_chunk)
 
@@ -440,10 +449,11 @@ class MambaBlock(nn.Module):
             D_residual = self.D[None, None, :, None] * x_heads
 
         x_heads = x_heads * dt[..., None]  # Scale by dt for scan
-        A_disc = mx.exp(A * dt)  # [B, L, n_heads]
+        log_a = A * dt  # log-space decay (pass directly to avoid exp→log roundtrip)
+        A_disc = mx.exp(log_a)  # [B, L, n_heads]
 
-        # 5. Selective scan
-        y = self._selective_scan(x_heads, A_disc, B_param, C_param, cache)
+        # 5. Selective scan (pass log_a for precision)
+        y = self._selective_scan(x_heads, A_disc, B_param, C_param, cache, log_a=log_a)
 
         # 6. Add D residual
         if self.D is not None:
