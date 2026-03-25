@@ -89,10 +89,13 @@ def main():
                 break
             tokens.append(t)
             n_generated += 1
-            # Stream: decode and print incrementally
-            text = tokenizer.decode(tokens[len(ids):])
-            sys.stdout.write(f"\r{text}")
-            sys.stdout.flush()
+            # Stream: print only the new delta text
+            new_text = tokenizer.decode(tokens[len(ids):])
+            old_text = tokenizer.decode(tokens[len(ids):-1]) if n_generated > 1 else ""
+            delta = new_text[len(old_text):]
+            if delta:
+                sys.stdout.write(delta)
+                sys.stdout.flush()
 
         elapsed = time.time() - t0
         speed = n_generated / elapsed if elapsed > 0 else 0
