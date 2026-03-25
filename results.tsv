@@ -20,3 +20,5 @@ e04f75c	1.687652	46.6	discard	beta1=0.8 (equal)
 e33e735	1.694922	46.6	discard	warmdown 0.7
 9b89b6e	1.695678	46.6	discard	2x embedding LR
 93473dd	1.677609	46.6	keep	chunk_size=128 — 884 steps
+b9ec9a9	1.683575	46.6	discard	chunk_size=256
+1cb78b4	1.675508	46.6	keep	GQA n_kv_heads=2 — 891 steps 15.4M
