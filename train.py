@@ -44,15 +44,15 @@ class HybridConfig:
     full_attn_layers: List[int] = field(default_factory=list)
 
 
-class SwiGLU(nn.Module):
+class FFN(nn.Module):
+    """Squared ReLU FFN (simpler, no gate — 2 matrices instead of 3)."""
     def __init__(self, d_model: int, d_ff: int):
         super().__init__()
         self.w1 = nn.Linear(d_model, d_ff, bias=False)
         self.w2 = nn.Linear(d_ff, d_model, bias=False)
-        self.w3 = nn.Linear(d_model, d_ff, bias=False)
 
     def __call__(self, x):
-        return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+        return self.w2(mx.maximum(self.w1(x), 0) ** 2)
 
 
 class MambaBlock(nn.Module):
@@ -233,7 +233,7 @@ class HybridBlock(nn.Module):
         self.norm2 = nn.RMSNorm(config.d_model)
         d_ff = int(config.d_model * config.ffn_mult)
         d_ff = ((d_ff + 255) // 256) * 256
-        self.ffn = SwiGLU(config.d_model, d_ff)
+        self.ffn = FFN(config.d_model, d_ff)
 
     def __call__(self, x):
         h = x + self.mixer(self.norm1(x))
@@ -269,7 +269,6 @@ class HybridLM(nn.Module):
                 m.conv_weight = (mx.random.normal(m.conv_weight.shape) * 0.02).astype(mx.float32)
             # FFN: gate projects init, output project zero
             layer.ffn.w1.weight = mx.random.uniform(-scale, scale, layer.ffn.w1.weight.shape).astype(mx.float32)
-            layer.ffn.w3.weight = mx.random.uniform(-scale, scale, layer.ffn.w3.weight.shape).astype(mx.float32)
             layer.ffn.w2.weight = mx.zeros_like(layer.ffn.w2.weight).astype(mx.float32)
 
     def __call__(self, input_ids, targets=None, reduction="mean"):
@@ -416,7 +415,7 @@ D_CONV = 4
 EXPAND = 2
 HEADDIM = 64
 CHUNK_SIZE = 64
-FFN_MULT = 2.667
+FFN_MULT = 4.0
 WINDOW_SIZE = None
 FULL_ATTN_LAYERS = []
 
