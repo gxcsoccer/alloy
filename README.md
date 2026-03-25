@@ -8,18 +8,34 @@ Alloy interleaves Mamba-2 (selective state-space) blocks with Attention blocks i
 
 ## Features
 
-- **Mamba-2 block** — selective scan with chunked parallel computation, pure MLX ops, autodiff-friendly
+- **Mamba-2 block** — selective scan with chunked parallel computation, Metal-accelerated conv1d (8x speedup)
 - **Attention block** — MHA / GQA / sliding-window, with RoPE
-- **HybridLM** — configurable interleaved architecture (Jamba-style), RMSNorm + SwiGLU FFN, weight-tied LM head
-- **Training** — `mx.value_and_grad` based loop, AdamW + cosine schedule, streaming JSONL dataloader with packing
+- **HybridLM** — configurable interleaved architecture, supports both Alloy-native and Zamba2 modes
+- **Training** — AdamW + cosine schedule, streaming JSONL dataloader with packing
 - **LoRA** — freeze-and-inject adapter, save/load/merge
 - **Generation** — autoregressive decoding with KV + SSM cache, top-p sampling, streaming output
-- **Weight conversion** — load Jamba / Zamba2 weights from HuggingFace safetensors
+- **Weight conversion** — load Zamba2 / Jamba weights from HuggingFace (verified on Zamba2-1.2B)
+- **Metal kernels** — fused conv1d+SiLU kernel for training and inference acceleration
+- **Autoresearch** — autonomous architecture search harness (28 experiments, 22.6% improvement)
 
 ## Quickstart
 
 ```bash
 pip install -e ".[dev]"
+```
+
+### Load a pretrained model
+
+```python
+from alloy.convert import load_pretrained
+from alloy.generate import generate
+from transformers import AutoTokenizer
+
+model = load_pretrained("path/to/Zamba2-1.2B")
+tokenizer = AutoTokenizer.from_pretrained("path/to/Zamba2-1.2B")
+text = generate(model, tokenizer, "The capital of France is", max_tokens=100)
+print(text)
+# The capital of France is Paris. It is the largest city in France and...
 ```
 
 ### Train from scratch
@@ -34,28 +50,6 @@ python -m alloy.train \
   --max-steps 10000
 ```
 
-Data format — one JSON object per line:
-
-```jsonl
-{"text": "..."}
-{"text": "..."}
-```
-
-### Generate
-
-```python
-from alloy.models.hybrid_model import HybridConfig, HybridLM
-from alloy.generate import generate
-from alloy.train import load_config
-
-config = load_config("configs/toy.yaml")
-model = HybridLM(config)
-model.load_weights("checkpoints/final.safetensors")
-
-# Bring your own tokenizer
-text = generate(model, tokenizer, "The quick brown", max_tokens=128)
-```
-
 ### LoRA fine-tune
 
 ```python
@@ -68,21 +62,44 @@ save_lora_weights(model, "adapter.npz")
 merge_lora_weights(model)  # fold adapter into base weights
 ```
 
-### Load HuggingFace weights
+### Autoresearch (autonomous architecture search)
 
-```python
-from alloy.convert import load_pretrained
+```bash
+# One-time data prep
+python prepare.py --num-shards 10
 
-model = load_pretrained("path/to/jamba-or-zamba2")
+# Run autonomous experiment loop (5-min budget per experiment)
+python train.py > run.log 2>&1
 ```
+
+See [program.md](program.md) and [docs/autoresearch-report.md](docs/autoresearch-report.md) for details.
 
 ## Model configurations
 
-| Config | d_model | Layers | Params | Memory (bf16) | Use case |
-|--------|---------|--------|--------|---------------|----------|
-| `toy.yaml` | 512 | 12 | ~100M | ~0.2 GB | Architecture validation |
-| `small.yaml` | 1024 | 24 | ~500M | ~1 GB | Quick experiments |
-| `medium.yaml` | 2048 | 32 | ~1.5B | ~3 GB | Training starting point |
+| Config | d_model | Layers | Params | Use case |
+|--------|---------|--------|--------|----------|
+| `toy.yaml` | 512 | 12 | ~100M | Architecture validation |
+| `small.yaml` | 1024 | 24 | ~500M | Quick experiments |
+| `medium.yaml` | 2048 | 32 | ~1.5B | Full training |
+| `autoresearch.yaml` | 512 | 2 | ~15M | Optimal for 5-min autoresearch budget |
+
+## Key findings from autoresearch
+
+28 autonomous experiments validated core architectural decisions:
+
+| Architecture | val_bpb | Notes |
+|-------------|---------|-------|
+| **Hybrid (1M+1A)** | **1.676** | Best — SSM + Attention complement each other |
+| Pure Mamba (2M) | 1.999 | +0.32 worse, lacks precise recall |
+| Pure Attention (2A) | 2.095 | +0.42 worse, despite more steps |
+
+**Key insights:**
+- **Mamba first, Attention last** — reversed order catastrophic (2.195)
+- **Shallow + wide wins** under fixed time budget (2L > 3L > 4L)
+- **GQA effective** even in hybrid models (n_kv_heads=2 helps)
+- Batch size 2^13 optimal (balance: gradient quality vs step count)
+
+See [docs/autoresearch-report.md](docs/autoresearch-report.md) for all 28 experiments.
 
 ## Project structure
 
@@ -90,49 +107,71 @@ model = load_pretrained("path/to/jamba-or-zamba2")
 alloy/
 ├── alloy/
 │   ├── models/
-│   │   ├── mamba_block.py       # Mamba-2 selective scan
+│   │   ├── mamba_block.py       # Mamba-2 (Alloy + Zamba2 modes)
+│   │   ├── mamba_kernels.py     # Metal GPU kernels
 │   │   ├── attention_block.py   # MHA / GQA / sliding window
-│   │   ├── hybrid_model.py      # HybridLM (config, block, full model)
-│   │   └── cache.py             # MambaCache / AttentionCache / HybridCache
+│   │   ├── hybrid_model.py      # HybridLM + HybridBlock
+│   │   └── cache.py             # MambaCache / AttentionCache / Zamba2HybridLayerCache
 │   ├── data/
 │   │   └── dataloader.py        # Streaming JSONL + packing
-│   ├── kernels/                  # Metal kernels (future)
 │   ├── generate.py              # Autoregressive generation
 │   ├── train.py                 # Training loop + CLI
 │   ├── lora.py                  # LoRA inject / save / merge
 │   └── convert.py               # HuggingFace weight conversion
 ├── configs/                      # YAML model configs
-├── tests/                        # 79 tests
+├── tests/                        # 88 tests
 ├── docs/
-│   └── spec.md                  # Full project spec
+│   ├── spec.md                  # Full project spec
+│   ├── autoresearch-report.md   # 28-experiment report
+│   └── autoresearch-integration.md
+├── prepare.py                    # Autoresearch data pipeline
+├── train.py                      # Autoresearch training script
+├── program.md                    # Autoresearch experiment protocol
 └── pyproject.toml
 ```
 
 ## Tests
 
 ```bash
-python -m pytest tests/ -v
+python -m pytest tests/ -v   # 88 tests, ~0.5s
 ```
 
 ## Architecture
 
+### Alloy mode (default)
+
 Each `HybridBlock` follows the pre-norm residual pattern:
 
 ```
-x → RMSNorm → [MambaBlock or AttentionBlock] → + → RMSNorm → SwiGLU FFN → + → out
-↑_______________________________________________↑    ↑________________________↑
+x → RMSNorm → [MambaBlock or AttentionBlock] → + → RMSNorm → FFN → + → out
+↑_______________________________________________↑    ↑________________↑
 ```
 
-Layer type (Mamba vs Attention) is determined by `attn_layer_indices` in config. For example, `[3, 7, 11]` in a 12-layer model gives a 3:1 SSM:Attention ratio.
+### Zamba2 mode (for pretrained Zamba2 models)
 
-The Mamba-2 selective scan uses a chunked parallel algorithm: each chunk of size C is computed via a C×C transfer-matrix matmul (fully parallel on Metal), with sequential state propagation between chunks. This gives ~3x speedup over naive sequential scan for long sequences.
+Hybrid layers contain both mamba and attention:
+
+```
+                    ┌─ cat(x, emb) → Norm → Attention → Norm → FFN ─┐
+x → shared_transformer ─────────────────────────────────────────────── linear
+    └─ (x + linear_out) → Norm → MambaDecoder → + → out ───────────────────┘
+```
+
+## Performance
+
+| Operation | Pure MLX | Metal Kernel | Speedup |
+|-----------|----------|-------------|---------|
+| Conv1d + SiLU | 3.6ms | 0.4ms | **8.3x** |
+| Zamba2-1.2B generation | 5.3 tok/s | — | — |
+| Zamba2-1.2B with KV cache | 24.6 tok/s | — | **4.6x** |
 
 ## References
 
 - [Mamba: Linear-Time Sequence Modeling](https://arxiv.org/abs/2312.00752) — Gu & Dao
 - [Transformers are SSMs](https://arxiv.org/abs/2405.21060) — Dao & Gu (Mamba-2)
 - [Jamba: A Hybrid Transformer-Mamba LM](https://arxiv.org/abs/2403.19887)
-- [Hymba: Hybrid-Head Architecture](https://developer.nvidia.com/blog/hymba-hybrid-head-architecture-boosts-small-language-model-performance/)
+- [Zamba2](https://arxiv.org/abs/2411.15242) — Zyphra
+- [autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) — Karpathy's autonomous research
 - [MLX](https://github.com/ml-explore/mlx)
 
 ## License
