@@ -92,9 +92,12 @@ class MambaBlock(nn.Module):
         log_a = mx.log(mx.clip(a_c, a_min=1e-10, a_max=None))
         log_a_cum = mx.cumsum(log_a, axis=1)
         lac = log_a_cum.transpose(0, 2, 1)
-        M = mx.exp(lac[:, :, :, None] - lac[:, :, None, :])
-        causal = mx.tril(mx.ones((cs, cs)))
-        M = M * causal
+        # Apply causal mask BEFORE exp to avoid inf: set upper-tri to -inf
+        M_log = lac[:, :, :, None] - lac[:, :, None, :]
+        causal_mask = mx.where(
+            mx.tril(mx.ones((cs, cs))) > 0, M_log, mx.array(float("-inf"))
+        )
+        M = mx.exp(causal_mask)
 
         b_flat = b_bar.transpose(0, 2, 1, 3, 4).reshape(
             B_size, n_heads, cs, d_state * self.headdim
@@ -245,6 +248,29 @@ class HybridLM(nn.Module):
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
         self.layers = [HybridBlock(config, i) for i in range(config.n_layers)]
         self.norm = nn.RMSNorm(config.d_model)
+        self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+    def init_weights(self):
+        """Initialize weights for stable training."""
+        scale = 3**0.5 * self.config.d_model**-0.5
+        self.embedding.weight = (mx.random.normal(self.embedding.weight.shape) * 1.0).astype(mx.float32)
+        self.lm_head.weight = (mx.random.normal(self.lm_head.weight.shape) * 0.001).astype(mx.float32)
+        for layer in self.layers:
+            if layer.is_attention:
+                m = layer.mixer
+                for proj in [m.q_proj, m.k_proj, m.v_proj]:
+                    proj.weight = mx.random.uniform(-scale, scale, proj.weight.shape).astype(mx.float32)
+                m.o_proj.weight = mx.zeros_like(m.o_proj.weight).astype(mx.float32)
+            else:
+                m = layer.mixer
+                m.in_proj.weight = mx.random.uniform(-scale, scale, m.in_proj.weight.shape).astype(mx.float32)
+                m.x_proj.weight = mx.random.uniform(-scale, scale, m.x_proj.weight.shape).astype(mx.float32)
+                m.out_proj.weight = mx.zeros_like(m.out_proj.weight).astype(mx.float32)
+                m.conv_weight = (mx.random.normal(m.conv_weight.shape) * 0.02).astype(mx.float32)
+            # FFN: gate projects init, output project zero
+            layer.ffn.w1.weight = mx.random.uniform(-scale, scale, layer.ffn.w1.weight.shape).astype(mx.float32)
+            layer.ffn.w3.weight = mx.random.uniform(-scale, scale, layer.ffn.w3.weight.shape).astype(mx.float32)
+            layer.ffn.w2.weight = mx.zeros_like(layer.ffn.w2.weight).astype(mx.float32)
 
     def __call__(self, input_ids, targets=None, reduction="mean"):
         """Forward pass compatible with autoresearch evaluate_bpb.
@@ -262,7 +288,8 @@ class HybridLM(nn.Module):
         for layer in self.layers:
             x = layer(x)
         x = self.norm(x)
-        logits = x @ self.embedding.weight.T
+        logits = self.lm_head(x).astype(mx.float32)
+        logits = 30.0 * mx.tanh(logits / 30.0)  # Clamp for stability
 
         if targets is None:
             return logits
@@ -271,12 +298,7 @@ class HybridLM(nn.Module):
         ce = nn.losses.cross_entropy(logits, targets, reduction="none")
         if reduction == "none":
             return ce
-        valid = targets != -1
-        targets_safe = mx.where(valid, targets, mx.zeros_like(targets))
-        ce = nn.losses.cross_entropy(logits, targets_safe, reduction="none")
-        ce = ce * valid
-        denom = mx.maximum(mx.sum(valid), 1)
-        return mx.sum(ce) / denom
+        return mx.mean(ce)
 
 
 # ===========================================================================
@@ -292,7 +314,9 @@ class AdamW:
 
         flat_params = tree_flatten(model.parameters())
         for path, param in flat_params:
-            if "embedding" in path and param.ndim == 2:
+            if "lm_head" in path:
+                cfg = {"lr": embedding_lr * 0.01, "betas": adam_betas, "eps": 1e-10, "wd": 0.0}
+            elif "embedding" in path and param.ndim == 2:
                 cfg = {"lr": embedding_lr, "betas": adam_betas, "eps": 1e-10, "wd": 0.0}
             elif "mixer" in path and "A_log" in path:
                 cfg = {"lr": scalar_lr * 0.1, "betas": adam_betas, "eps": 1e-10, "wd": 0.0}
@@ -381,31 +405,31 @@ class AdamW:
 # Hyperparameters (edit these to experiment)
 # ===========================================================================
 
-# Architecture
-DEPTH = 8
-D_MODEL = 768
-ATTN_LAYER_INDICES = [3, 7]  # Mamba:Attention = 3:1
+# Architecture — start small for fast compilation, scale up once working
+DEPTH = 4
+D_MODEL = 384
+ATTN_LAYER_INDICES = [3]  # Mamba:Attention = 3:1
 N_HEADS = 6
 N_KV_HEADS = 6
-D_STATE = 64
+D_STATE = 16
 D_CONV = 4
 EXPAND = 2
 HEADDIM = 64
-CHUNK_SIZE = 256
+CHUNK_SIZE = 64
 FFN_MULT = 2.667
 WINDOW_SIZE = None
 FULL_ATTN_LAYERS = []
 
-# Optimizer
+# Optimizer — conservative LRs for hybrid model stability
 TOTAL_BATCH_SIZE = 2**16
-DEVICE_BATCH_SIZE = 16
-MAMBA_LR = 0.04
-ATTN_LR = 0.04
-EMBEDDING_LR = 0.6
-FFN_LR = 0.04
-SCALAR_LR = 0.5
-WEIGHT_DECAY = 0.2
-ADAM_BETAS = (0.8, 0.95)
+DEVICE_BATCH_SIZE = 4
+MAMBA_LR = 0.004
+ATTN_LR = 0.004
+EMBEDDING_LR = 0.06
+FFN_LR = 0.004
+SCALAR_LR = 0.05
+WEIGHT_DECAY = 0.1
+ADAM_BETAS = (0.9, 0.95)
 WARMUP_RATIO = 0.0
 WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
@@ -462,6 +486,7 @@ config = HybridConfig(
 )
 
 model = HybridLM(config)
+model.init_weights()
 mx.eval(model.parameters())
 num_params = sum(param.size for _, param in tree_flatten(model.parameters()))
 
@@ -499,12 +524,16 @@ while True:
     accum_grads = None
     train_loss = None
 
-    for _ in range(grad_accum_steps):
+    for ga_i in range(grad_accum_steps):
         loss, grads = loss_grad_fn(model, x, y)
         mx.eval(loss, grads)
         if t_compiled is None:
             t_compiled = time.time()
             print(f"Model compiled in {t_compiled - t_data:.1f}s")
+        loss_f = float(loss.item())
+        if math.isnan(loss_f):
+            print(f"FAIL: NaN in grad_accum iter {ga_i} at step {step}")
+            raise SystemExit(1)
         train_loss = loss
         if accum_grads is None:
             accum_grads = grads
@@ -522,8 +551,8 @@ while True:
     mx.eval(model.parameters(), *optimizer.state)
 
     train_loss_f = float(train_loss.item())
-    if train_loss_f > 100:
-        print("FAIL")
+    if train_loss_f > 100 or math.isnan(train_loss_f):
+        print(f"FAIL (loss={train_loss_f}) at step {step} after optimizer update")
         raise SystemExit(1)
 
     dt = time.time() - t0
