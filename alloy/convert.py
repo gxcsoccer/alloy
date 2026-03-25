@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import mlx.core as mx
+import mlx.nn as nn
 
 from alloy.models.hybrid_model import HybridConfig, HybridLM
 
@@ -438,6 +439,140 @@ def _convert_zamba_mamba_block(
 
 
 # ---------------------------------------------------------------------------
+# Nemotron-H (NVIDIA)
+# ---------------------------------------------------------------------------
+# Flat 52-layer structure: alternating Mamba / MLP / Attention layers.
+# Pattern: M-MLP-M-MLP-...-M-ATTN-MLP-M-MLP-...
+#
+# backbone.layers.{i}.norm.weight              — pre-norm for every layer
+# backbone.layers.{i}.mixer.in_proj.weight     — Mamba: combined projection
+# backbone.layers.{i}.mixer.conv1d.{weight,bias}
+# backbone.layers.{i}.mixer.{A_log,D,dt_bias,norm.weight,out_proj.weight}
+# backbone.layers.{i}.mixer.{q,k,v,o}_proj.weight  — Attention layers
+# backbone.layers.{i}.mixer.{up,down}_proj.weight   — MLP layers
+# backbone.embeddings.weight, backbone.norm_f.weight, lm_head.weight
+
+
+def _parse_nemotron_pattern(pattern: str) -> List[str]:
+    """Parse Nemotron-H hybrid_override_pattern into flat layer types.
+
+    Pattern like 'M-M-M-M*-M-...' where M=Mamba block, M*=Attention block.
+    M  → 2 layers: [mamba, mlp]
+    M* → 3 layers: [mamba, attention, mlp]
+    Total: 20×M + 4×M* = 20×2 + 4×3 = 52 layers.
+    """
+    entries = [e for e in pattern.rstrip("-").split("-") if e]
+    layer_types = []
+    for entry in entries:
+        if entry == "M*":
+            layer_types.extend(["mamba", "attention", "mlp"])
+        else:
+            layer_types.extend(["mamba", "mlp"])
+    return layer_types
+
+
+def convert_nemotron_h(model_path: str) -> Tuple[HybridConfig, Dict[str, mx.array]]:
+    """Convert Nemotron-H model weights to Alloy format.
+
+    Nemotron-H uses a flat layer structure where each layer is exactly one of:
+    Mamba, Attention, or MLP. No nested blocks.
+    """
+    hf_cfg = load_hf_config(model_path)
+    hf_weights = load_hf_weights(model_path)
+
+    d_model = hf_cfg["hidden_size"]
+    n_layers = hf_cfg["num_hidden_layers"]
+    n_heads = hf_cfg.get("num_attention_heads", 32)
+    n_kv_heads = hf_cfg.get("num_key_value_heads", 8)
+    d_state = hf_cfg.get("ssm_state_size", 128)
+    d_conv = hf_cfg.get("conv_kernel", 4)
+    expand = hf_cfg.get("expand", 2)
+    n_groups = hf_cfg.get("n_groups", 8)
+    mamba_head_dim = hf_cfg.get("mamba_head_dim", 64)
+    chunk_size = hf_cfg.get("chunk_size", 128)
+    ffn_hidden = hf_cfg.get("intermediate_size", 21504)
+    vocab_size = hf_cfg.get("vocab_size", 131072)
+
+    # Parse layer pattern
+    pattern = hf_cfg.get("hybrid_override_pattern", "")
+    if pattern:
+        layer_types = _parse_nemotron_pattern(pattern)
+    else:
+        # Infer from weights
+        layer_types = []
+        for i in range(n_layers):
+            if f"backbone.layers.{i}.mixer.A_log" in hf_weights:
+                layer_types.append("mamba")
+            elif f"backbone.layers.{i}.mixer.q_proj.weight" in hf_weights:
+                layer_types.append("attention")
+            elif f"backbone.layers.{i}.mixer.down_proj.weight" in hf_weights:
+                layer_types.append("mlp")
+
+    attn_indices = [i for i, lt in enumerate(layer_types) if lt == "attention"]
+
+    config = HybridConfig(
+        vocab_size=vocab_size,
+        d_model=d_model,
+        n_layers=len(layer_types),
+        attn_layer_indices=attn_indices,
+        n_heads=n_heads,
+        n_kv_heads=n_kv_heads,
+        d_state=d_state,
+        d_conv=d_conv,
+        expand=expand,
+        headdim=mamba_head_dim,
+        chunk_size=chunk_size,
+        ffn_hidden_size=ffn_hidden,
+        combined_proj=True,
+        n_groups=n_groups,
+        use_D=True,
+        use_inner_norm=True,
+        layer_types=layer_types,
+    )
+
+    alloy_weights = {}
+
+    # Embedding
+    _map(alloy_weights, hf_weights, "backbone.embeddings.weight", "embedding.weight")
+
+    # Final norm
+    _map(alloy_weights, hf_weights, "backbone.norm_f.weight", "norm.weight")
+
+    # Separate LM head
+    _map(alloy_weights, hf_weights, "lm_head.weight", "lm_head.weight")
+
+    # Per-layer
+    for i, lt in enumerate(layer_types):
+        hf_pre = f"backbone.layers.{i}"
+        al_pre = f"layers.{i}"
+
+        # Pre-norm (all layers have this)
+        _map(alloy_weights, hf_weights,
+             f"{hf_pre}.norm.weight", f"{al_pre}.norm.weight")
+
+        if lt == "mamba":
+            _convert_zamba_mamba_block(
+                alloy_weights, hf_weights,
+                hf_prefix=f"{hf_pre}.mixer",
+                al_prefix=f"{al_pre}.mixer",
+            )
+        elif lt == "attention":
+            for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                _map(alloy_weights, hf_weights,
+                     f"{hf_pre}.mixer.{proj}.weight",
+                     f"{al_pre}.mixer.{proj}.weight")
+        elif lt == "mlp":
+            _map(alloy_weights, hf_weights,
+                 f"{hf_pre}.mixer.up_proj.weight",
+                 f"{al_pre}.mixer.up_proj.weight")
+            _map(alloy_weights, hf_weights,
+                 f"{hf_pre}.mixer.down_proj.weight",
+                 f"{al_pre}.mixer.down_proj.weight")
+
+    return config, alloy_weights
+
+
+# ---------------------------------------------------------------------------
 # Auto-detect and convert
 # ---------------------------------------------------------------------------
 
@@ -457,10 +592,12 @@ def convert_from_hf(model_path: str) -> Tuple[HybridConfig, Dict[str, mx.array]]
         return convert_jamba(model_path)
     elif "zamba" in model_type:
         return convert_zamba(model_path)
+    elif "nemotron_h" in model_type:
+        return convert_nemotron_h(model_path)
     else:
         raise ValueError(
             f"Unsupported model type: {model_type}. "
-            "Supported: jamba, zamba2"
+            "Supported: jamba, zamba2, nemotron_h"
         )
 
 
@@ -477,6 +614,9 @@ def load_pretrained(model_path: str) -> HybridLM:
     """
     config, weights = convert_from_hf(model_path)
     model = HybridLM(config)
+    # Create separate lm_head if weights include it
+    if "lm_head.weight" in weights:
+        model.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.parameters())
     return model

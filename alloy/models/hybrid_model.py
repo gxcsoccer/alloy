@@ -60,6 +60,9 @@ class HybridConfig:
     use_inner_norm: bool = False  # Mamba inner RMS norm
     attn_d_model: Optional[int] = None  # Attention hidden size (if != d_model)
     zamba2_hybrid: bool = False  # Hybrid layers have both mamba+attention
+    # Nemotron-H: flat layer types (each layer is exactly one of mamba/attention/mlp)
+    layer_types: Optional[List[str]] = None  # e.g. ["mamba","mlp","mamba","mlp",...,"attention","mlp"]
+    ffn_hidden_size: Optional[int] = None  # explicit FFN hidden size (if not d_model * ffn_mult)
 
 
 class SwiGLU(nn.Module):
@@ -78,6 +81,61 @@ class SwiGLU(nn.Module):
 
     def __call__(self, x: mx.array) -> mx.array:
         return self.w2(nn.silu(self.w1(x)) * self.w3(x))
+
+
+class SquaredReLUMLP(nn.Module):
+    """MLP with squared ReLU activation (Nemotron-H style, 2 matrices)."""
+
+    def __init__(self, d_model: int, d_ff: int):
+        super().__init__()
+        self.up_proj = nn.Linear(d_model, d_ff, bias=False)
+        self.down_proj = nn.Linear(d_ff, d_model, bias=False)
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return self.down_proj(mx.maximum(self.up_proj(x), 0) ** 2)
+
+
+class FlatLayer(nn.Module):
+    """Single flat layer: RMSNorm + one operation (Mamba, Attention, or MLP).
+
+    Used by Nemotron-H where each of the 52 layers does exactly one thing.
+    """
+
+    def __init__(self, config: HybridConfig, layer_idx: int, layer_type: str):
+        super().__init__()
+        self.layer_type = layer_type
+        self.norm = nn.RMSNorm(config.d_model)
+
+        if layer_type == "mamba":
+            self.mixer = MambaBlock(
+                d_model=config.d_model,
+                d_state=config.d_state,
+                d_conv=config.d_conv,
+                expand=config.expand,
+                headdim=config.headdim,
+                chunk_size=config.chunk_size,
+                combined_proj=config.combined_proj,
+                n_groups=config.n_groups,
+                use_D=config.use_D,
+                use_inner_norm=config.use_inner_norm,
+            )
+        elif layer_type == "attention":
+            self.mixer = AttentionBlock(
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                n_kv_heads=config.n_kv_heads,
+            )
+        elif layer_type == "mlp":
+            d_ff = config.ffn_hidden_size or int(config.d_model * config.ffn_mult)
+            self.mixer = SquaredReLUMLP(config.d_model, d_ff)
+
+    def __call__(self, x: mx.array, mask=None, cache=None, **kwargs):
+        if self.layer_type == "attention":
+            return x + self.mixer(self.norm(x), mask=mask, cache=cache)
+        elif self.layer_type == "mamba":
+            return x + self.mixer(self.norm(x), cache=cache)
+        else:
+            return x + self.mixer(self.norm(x))
 
 
 class HybridBlock(nn.Module):
@@ -213,9 +271,20 @@ class HybridLM(nn.Module):
         self.config = config
 
         self.embedding = nn.Embedding(config.vocab_size, config.d_model)
-        self.layers = [HybridBlock(config, i) for i in range(config.n_layers)]
+
+        if config.layer_types is not None:
+            # Nemotron-H flat mode: each layer is exactly one type
+            self.layers = [
+                FlatLayer(config, i, lt)
+                for i, lt in enumerate(config.layer_types)
+            ]
+        else:
+            # Alloy/Zamba2 block mode: each block has mixer + FFN
+            self.layers = [HybridBlock(config, i) for i in range(config.n_layers)]
+
         self.norm = nn.RMSNorm(config.d_model)
-        # LM head is weight-tied with embedding (handled in __call__)
+        # LM head: separate for Nemotron-H, weight-tied for others
+        self.lm_head = None  # weight-tied by default; set during load if separate
 
     def to_bfloat16(self):
         """Convert all weights to bfloat16 for memory reduction.
@@ -284,6 +353,9 @@ class HybridLM(nn.Module):
 
         x = self.norm(x)
 
-        # Weight-tied LM head: logits = x @ embedding.weight^T
-        logits = x @ self.embedding.weight.T  # [B, L, vocab_size]
+        # LM head: separate or weight-tied
+        if self.lm_head is not None:
+            logits = self.lm_head(x)
+        else:
+            logits = x @ self.embedding.weight.T  # [B, L, vocab_size]
         return logits
