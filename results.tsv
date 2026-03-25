@@ -3,3 +3,6 @@ commit	val_bpb	memory_gb	status	description
 41cabeb	2.536933	35.0	discard	3x learning rates (too aggressive)
 c0b2c19	2.028173	46.6	keep	shallow+wide 2L (1M+1A) d512 — 108 steps
 1ce9f2c	1.838213	46.6	keep	halve total batch to 2^15 — 212 steps
+b156ef6	1.910234	46.6	discard	2x learning rates
+b81f982	0.000000	0.0	crash	d_model=640 OOM
+87e4b7b	1.752071	46.6	keep	halve batch to 2^14 — 423 steps
