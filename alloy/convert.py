@@ -339,15 +339,24 @@ def convert_zamba(model_path: str) -> Tuple[HybridConfig, Dict[str, mx.array]]:
                  f"{hf_pre}.linear.weight",
                  f"{al_pre}.linear.weight")
 
-            # Shared transformer: duplicate from the source layer
+            # Shared transformer: duplicate from the source layer + merge LoRA adapters
             src = f"model.layers.{shared_layer}" if shared_layer is not None else hf_pre
+            adapter_idx = attn_indices.index(i)  # which adapter in the list
 
-            # Attention projections (shared, duplicated per-layer)
+            # Attention projections (shared + per-layer LoRA adapter)
             attn_pre = f"{src}.shared_transformer.self_attn"
+            adapter_map = {"q_proj": "linear_q", "k_proj": "linear_k", "v_proj": "linear_v"}
             for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
-                _map(alloy_weights, hf_weights,
-                     f"{attn_pre}.{proj}.weight",
-                     f"{al_pre}.mixer.{proj}.weight")
+                base_w = hf_weights[f"{attn_pre}.{proj}.weight"]
+                # Merge LoRA adapter: W_eff = W_base + B @ A
+                if proj in adapter_map:
+                    a_key = f"{attn_pre}.{adapter_map[proj]}_adapter_list.{adapter_idx}.0.weight"
+                    b_key = f"{attn_pre}.{adapter_map[proj]}_adapter_list.{adapter_idx}.1.weight"
+                    if a_key in hf_weights and b_key in hf_weights:
+                        A = hf_weights[a_key]  # [rank, in_dim]
+                        B = hf_weights[b_key]  # [out_dim, rank]
+                        base_w = base_w + B @ A
+                alloy_weights[f"{al_pre}.mixer.{proj}.weight"] = base_w
 
             # Attention norm (shared)
             _map(alloy_weights, hf_weights,
@@ -355,10 +364,18 @@ def convert_zamba(model_path: str) -> Tuple[HybridConfig, Dict[str, mx.array]]:
                  f"{al_pre}.attn_norm.weight")
 
             # FFN: fused gate_up_proj → split into w1 (gate) + w3 (up)
+            # Merge gate_up_proj adapter
             ffn_pre = f"{src}.shared_transformer.feed_forward"
             gate_up_key = f"{ffn_pre}.gate_up_proj.weight"
             if gate_up_key in hf_weights:
                 gate_up = hf_weights[gate_up_key]  # [2 * ffn_dim, d_model]
+                # Merge adapter
+                a_key = f"{ffn_pre}.gate_up_proj_adapter_list.{adapter_idx}.0.weight"
+                b_key = f"{ffn_pre}.gate_up_proj_adapter_list.{adapter_idx}.1.weight"
+                if a_key in hf_weights and b_key in hf_weights:
+                    A = hf_weights[a_key]  # [rank, d_model]
+                    B = hf_weights[b_key]  # [2*ffn_dim, rank]
+                    gate_up = gate_up + B @ A
                 half = gate_up.shape[0] // 2
                 alloy_weights[f"{al_pre}.ffn.w1.weight"] = gate_up[:half]  # gate
                 alloy_weights[f"{al_pre}.ffn.w3.weight"] = gate_up[half:]  # up
