@@ -217,6 +217,18 @@ class HybridLM(nn.Module):
         self.norm = nn.RMSNorm(config.d_model)
         # LM head is weight-tied with embedding (handled in __call__)
 
+    def to_bfloat16(self):
+        """Convert all weights to bfloat16 for memory reduction.
+
+        The scan computation internally promotes to float32 for precision,
+        so this is safe for both training and inference.
+        """
+        from mlx.utils import tree_flatten, tree_unflatten
+        params = [(k, v.astype(mx.bfloat16) if v.dtype == mx.float32 else v)
+                  for k, v in tree_flatten(self.parameters())]
+        self.load_weights(params, strict=False)
+        return self
+
     def make_cache(self) -> HybridCache:
         """Create an empty HybridCache matching this model's architecture."""
         return HybridCache(

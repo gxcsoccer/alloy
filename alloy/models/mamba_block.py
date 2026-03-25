@@ -175,6 +175,12 @@ class MambaBlock(nn.Module):
         Returns:
             Output per head, shape [B, L, n_heads, headdim].
         """
+        # Promote to float32 for scan precision
+        x = x.astype(mx.float32) if x.dtype != mx.float32 else x
+        B = B.astype(mx.float32) if B.dtype != mx.float32 else B
+        C = C.astype(mx.float32) if C.dtype != mx.float32 else C
+        A_disc = A_disc.astype(mx.float32) if A_disc.dtype != mx.float32 else A_disc
+
         B_size, L, n_heads, headdim = x.shape
 
         if cache is not None and cache.ssm_state is not None:
@@ -226,14 +232,19 @@ class MambaBlock(nn.Module):
         headdim = self.headdim
         d_state = self.d_state
 
+        # Promote to float32 for scan precision (critical for bf16 training)
+        x_c = x_c.astype(mx.float32) if x_c.dtype != mx.float32 else x_c
+        B_c = B_c.astype(mx.float32) if B_c.dtype != mx.float32 else B_c
+        C_c = C_c.astype(mx.float32) if C_c.dtype != mx.float32 else C_c
+
         # b_bar = B outer x: [B, cs, n_heads, d_state, headdim]
         b_bar = B_c[..., None] * x_c[:, :, :, None, :]
 
         # Build transfer matrix in log-space for numerical stability
         if log_a_direct is not None:
-            log_a = log_a_direct  # A*dt directly, avoids exp→log roundtrip
+            log_a = log_a_direct.astype(mx.float32) if log_a_direct.dtype != mx.float32 else log_a_direct
         else:
-            log_a = mx.log(mx.clip(a_c, a_min=1e-10, a_max=None))
+            log_a = mx.log(mx.clip(a_c.astype(mx.float32), a_min=1e-10, a_max=None))
         log_a_cum = mx.cumsum(log_a, axis=1)  # [B, cs, n_heads]
 
         # M[t, s] = exp(log_a_cum[t] - log_a_cum[s]) for t >= s
