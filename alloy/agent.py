@@ -140,8 +140,12 @@ def build_system_prompt(tool_registry):
     return f'Use EXACT function names. Respond with {{"tool_calls":[...]}} or plain text.\n{tools_json}'
 
 
-def agent_turn(model, tokenizer, messages, tool_registry, max_tokens=150):
-    """Run one agent turn: generate → maybe call tool → return response."""
+def agent_turn(model, tokenizer, messages, tool_registry, max_tokens=150, stream=False):
+    """Run one agent turn: generate → maybe call tool → return response.
+
+    Args:
+        stream: If True, print text tokens as they're generated.
+    """
     formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     ids = tokenizer.encode(formatted)
     tokens = list(ids)
@@ -159,6 +163,11 @@ def agent_turn(model, tokenizer, messages, tool_registry, max_tokens=150):
 
         # Track JSON braces/brackets to stop after first complete object
         char = tokenizer.decode([t])
+
+        # Stream text tokens (but not JSON tool calls)
+        if stream and not started_json:
+            print(char, end="", flush=True)
+
         for c in char:
             if c == '{':
                 started_json = True
@@ -204,7 +213,7 @@ def agent_turn(model, tokenizer, messages, tool_registry, max_tokens=150):
         return "text", output, output
 
 
-def run_agent_loop(model, tokenizer, user_input, tool_registry, max_turns=5):
+def run_agent_loop(model, tokenizer, user_input, tool_registry, max_turns=5, stream=False):
     """Full agent loop: user → model → tool → model → ... → final answer."""
     system_prompt = build_system_prompt(tool_registry)
     messages = [
@@ -213,7 +222,7 @@ def run_agent_loop(model, tokenizer, user_input, tool_registry, max_turns=5):
     ]
 
     for turn in range(max_turns):
-        result_type, result, raw = agent_turn(model, tokenizer, messages, tool_registry)
+        result_type, result, raw = agent_turn(model, tokenizer, messages, tool_registry, stream=stream)
 
         if result_type == "tool_call":
             tool_name = result["name"]
@@ -228,7 +237,8 @@ def run_agent_loop(model, tokenizer, user_input, tool_registry, max_turns=5):
             messages.append({"role": "assistant", "content": raw})
             messages.append({"role": "user", "content": f"Tool result: {tool_result}\n\nPlease answer the original question based on this result."})
         else:
-            # Direct text response
+            if stream:
+                print()  # newline after streamed text
             return result
 
     return "I wasn't able to complete the task within the turn limit."
@@ -288,10 +298,10 @@ def main():
             continue
 
         t0 = time.time()
-        response = run_agent_loop(model, tokenizer, user_input, BUILTIN_TOOLS)
+        print(f"\nAgent> ", end="", flush=True)
+        response = run_agent_loop(model, tokenizer, user_input, BUILTIN_TOOLS, stream=True)
         elapsed = time.time() - t0
 
-        print(f"\nAgent> {response}")
         print(f"  [{elapsed:.1f}s]\n")
 
 
