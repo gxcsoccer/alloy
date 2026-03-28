@@ -61,11 +61,16 @@ class AttentionBlock(nn.Module):
         k_idx = mx.arange(kv_len)[None, :]  # [1, kv_len]
 
         # Causal: query can only attend to keys at positions <= its own
-        mask = mx.where(k_idx <= q_idx, 0.0, -math.inf)
+        # Use large negative in bf16 to avoid promoting the whole chain to fp32.
+        # -65504 is the largest finite bf16 negative; sufficient to zero out softmax.
+        mask = mx.where(k_idx <= q_idx,
+                        mx.array(0.0, dtype=mx.bfloat16),
+                        mx.array(-65504.0, dtype=mx.bfloat16))
 
         # Sliding window: additionally block keys too far in the past
         if self.window_size is not None:
-            mask = mx.where(q_idx - k_idx < self.window_size, mask, -math.inf)
+            mask = mx.where(q_idx - k_idx < self.window_size, mask,
+                           mx.array(-65504.0, dtype=mx.bfloat16))
 
         return mask[None, None, :, :]  # [1, 1, q_len, kv_len]
 

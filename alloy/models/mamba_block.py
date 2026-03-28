@@ -300,6 +300,9 @@ class MambaBlock(nn.Module):
         chunks. Falls back to sequential scan for L <= chunk_size or when
         decoding with cache (L is typically 1).
 
+        Internally promotes to float32 for scan precision, then casts output
+        back to the input dtype for mixed-precision training support.
+
         Args:
             x: Input per head, shape [B, L, n_heads, headdim].
             A_disc: Discretized decay, shape [B, L, n_heads].
@@ -312,6 +315,7 @@ class MambaBlock(nn.Module):
         Returns:
             Output per head, shape [B, L, n_heads, headdim].
         """
+        input_dtype = x.dtype
         B_size, L, n_heads, headdim = x.shape
 
         # For single-step decoding, use sequential (no overhead)
@@ -355,7 +359,11 @@ class MambaBlock(nn.Module):
         if cache is not None:
             cache.ssm_state = h
 
-        return mx.concatenate(outputs, axis=1)  # [B, L, n_heads, headdim]
+        result = mx.concatenate(outputs, axis=1)  # [B, L, n_heads, headdim]
+        # Cast back to input dtype for mixed-precision training (scan uses fp32 internally)
+        if result.dtype != input_dtype:
+            result = result.astype(input_dtype)
+        return result
 
     def __call__(self, x: mx.array, cache=None) -> mx.array:
         """Forward pass.

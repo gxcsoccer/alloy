@@ -326,6 +326,28 @@ class HybridLM(nn.Module):
             zamba2_hybrid=self.config.zamba2_hybrid,
         )
 
+    def enable_grad_checkpoint(self, attention_only=False):
+        """Enable gradient checkpointing on layers.
+
+        Wraps layer __call__ with mx.checkpoint so activations are
+        recomputed during backward pass, trading compute for memory.
+
+        Args:
+            attention_only: If True, only checkpoint attention layers (O(L²)
+                memory bottleneck). Much less overhead than checkpointing
+                all layers — Nemotron-H only has 4 attention layers out of 52.
+        """
+        n = 0
+        for layer in self.layers:
+            if attention_only:
+                if getattr(layer, 'layer_type', '') == 'attention':
+                    layer.__call__ = mx.checkpoint(layer.__call__)
+                    n += 1
+            else:
+                layer.__call__ = mx.checkpoint(layer.__call__)
+                n += 1
+        return n
+
     def __call__(
         self,
         input_ids: mx.array,
