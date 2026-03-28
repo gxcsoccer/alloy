@@ -129,23 +129,15 @@ def execute_tool(tool_call, tool_registry):
 # ===========================================================================
 
 def build_system_prompt(tool_registry):
-    """Build system prompt with tool descriptions."""
+    """Build compact system prompt with tool descriptions (V8 format)."""
     tools = []
     for name, info in tool_registry.items():
-        tools.append({
-            "name": name,
-            "description": info["description"],
-            "parameters": info["parameters"],
-        })
-    return f"""You are a helpful assistant with access to these tools:
-
-{json.dumps(tools, indent=2)}
-
-When you need to use a tool, respond with a JSON object:
-{{"tool_calls": [{{"name": "tool_name", "arguments": {{...}}}}]}}
-
-If no tool is needed, respond directly with text.
-After receiving tool results, use them to answer the user's question."""
+        entry = {"name": name, "description": info["description"]}
+        if info.get("parameters"):
+            entry["parameters"] = info["parameters"]
+        tools.append(entry)
+    tools_json = json.dumps(tools, separators=(',', ':'))
+    return f'Use EXACT function names. Respond with {{"tool_calls":[...]}} or plain text.\n{tools_json}'
 
 
 def agent_turn(model, tokenizer, messages, tool_registry, max_tokens=150):
@@ -156,6 +148,7 @@ def agent_turn(model, tokenizer, messages, tool_registry, max_tokens=150):
 
     # Generate with early stopping on tool call completion
     brace_count = 0
+    bracket_count = 0
     started_json = False
 
     for token in stream_generate(model, mx.array([ids]), max_tokens=max_tokens, temperature=0.0):
@@ -164,7 +157,7 @@ def agent_turn(model, tokenizer, messages, tool_registry, max_tokens=150):
         if t == tokenizer.eos_token_id:
             break
 
-        # Track JSON braces to stop after first complete object
+        # Track JSON braces/brackets to stop after first complete object
         char = tokenizer.decode([t])
         for c in char:
             if c == '{':
@@ -172,17 +165,36 @@ def agent_turn(model, tokenizer, messages, tool_registry, max_tokens=150):
                 brace_count += 1
             elif c == '}':
                 brace_count -= 1
-                if started_json and brace_count <= 0:
-                    # JSON object complete — stop generating
-                    break
-        if started_json and brace_count <= 0:
+            elif c == '[':
+                bracket_count += 1
+            elif c == ']':
+                bracket_count -= 1
+
+            if started_json and brace_count <= 0 and bracket_count <= 0:
+                break
+
+        if started_json and brace_count <= 0 and bracket_count <= 0:
             break
 
     output = tokenizer.decode(tokens[len(ids):]).strip()
     # Clean trailing noise after first complete JSON
-    for end in ['<SPECIAL', '\n\n\n']:
+    for end in ['<SPECIAL', '\n\n\n', '<|', '</s>']:
         if end in output:
             output = output[:output.index(end)]
+
+    # Fix repetition artifacts: truncate at first complete JSON object
+    if '{"tool_calls"' in output:
+        try:
+            # Try to parse progressively longer substrings
+            for i in range(len(output), 0, -1):
+                try:
+                    json.loads(output[:i])
+                    output = output[:i]
+                    break
+                except json.JSONDecodeError:
+                    continue
+        except Exception:
+            pass
 
     # Check if it's a tool call
     tool_call = parse_tool_call(output)

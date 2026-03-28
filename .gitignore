@@ -33,3 +33,14 @@ data/
 # Metal kernels build artifacts
 *.metallib
 *.air
+
+# Training and eval logs
+train_agent*.log
+race_*.log
+run.log
+eval_v*.log
+eval_results_*.json
+race_results.json
+
+# Claude Code
+.claude/
