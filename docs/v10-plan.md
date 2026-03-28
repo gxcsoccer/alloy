@@ -1,96 +1,157 @@
-# V10 Training Plan
+# V10 Plan: Usable Agent on Mac Mini 64GB
 
-## Background
+## Goal
 
-### Current Best Results
+在 Mac Mini 64GB 上跑起一个**实际可用**的 agent 模型（工具选择 >90%，参数准确 >80%，延迟 <5s）。
 
-| Version | BFCL simple | Self tool_sel | Irrelevance | Names | OVERALL | no_tool |
-|---------|------------|--------------|-------------|-------|---------|---------|
-| V8 | **56%** | 45.5% | 8% | **98%** | **21.2%** | 100% |
-| V9d (Lane D) | 46% | **63.6%** | 32% | 90% | 16.8% | 80% |
+## 现状评估
 
-### Core Findings from V8-V9 Experiments
+### Nemotron-H-8B + LoRA 的天花板
 
-1. **Severe underfitting**: V8 saw only 19.5% of training data (2000 steps / 10,241 examples). Lane D saw 14%. Models stopped before learning the full dataset.
+| 指标 | 当前最好 | 可用标准 | 差距 |
+|------|---------|---------|------|
+| 工具选择 | 63.6% (V9d) | >90% | 远 |
+| BFCL simple | 56% (V8) | >80% | 远 |
+| 参数准确 | ~50% | >80% | 远 |
+| Irrelevance | 32% (V9d) | >90% | 远 |
 
-2. **Irrelevance vs tool-calling is zero-sum in supervised training**: Any amount of "don't call this tool" data degrades tool-calling accuracy. Tested with full irrelevance (V9c: simple 30%, irr 72%), reduced (Lane E: simple 36%, irr 44%), and two-stage (Lane F: simple 30%, irr 72%). All hurt tool-calling.
+**结论：继续给 Nemotron-H 加训不是通往"可用 agent"的路。** 该模型预训练时没见过 tool calling，LoRA 容量不足以从零学会。
 
-3. **Dotted namespace data helps self-eval**: Lane D achieved 63.6% self tool_select (record), up from V8's 45.5%. Dotted names (module.function) improve the model's understanding of tool namespaces.
+### 已建成的基础设施（可复用）
 
-4. **xlam is undersampled**: Only using 8k of 57k available (14%). xlam provides the critical generalization signal for unseen BFCL functions.
+- Agent 执行框架：工具注册、多轮对话、流式输出
+- 评估体系：BFCL 5 类 AST 评估 + self-built 工具测试
+- 训练管线：数据生成、xlam 清洗压缩、QLoRA + 4 项内存优化（8x 加速）
+- 模型层：bf16 支持、attention-only checkpoint、Mamba scan dtype 修复
 
-5. **Memory optimizations validated** (7x faster):
-   - Length-sorted batching: eliminates GPU cache thrashing
-   - Pre-long-sequence cache clearing: prevents fragmentation
-   - Attention-only gradient checkpointing: 4 attention layers (O(L^2)) out of 52
-   - bf16 LoRA: works but degrades names accuracy — **do not use for production**
+---
 
-## V10 Changes
+## 新方向：接入已有 Tool Calling 能力的模型
 
-### Data Composition
+### 2026 年 3 月开源模型调研
 
-| Component | V8/Lane D | V10 | Rationale |
-|-----------|-----------|-----|-----------|
-| Base (gen_tool_data) | V8 + dotted names | Same as Lane D | tool_select 63.6% validated |
-| xlam sample | 8,000 | **15,000** | More diverse function signatures for BFCL generalization |
-| no-tool ratio | 25% | **18%** | Reduce conservative bias, maximize tool-calling signal |
-| V8 coarse irrelevance | 392 examples | **Remove** | Causes no_tool precision 80% (false positives on self-eval) |
-| V9 BFCL-style irrelevance | 0 (Lane D) | **0** | Zero-sum trade-off confirmed; handle at inference time |
+#### Qwen3.5 系列（2026 年 2 月发布）
 
-### Training Config
+| 模型 | 总参/激活参 | 架构 | 4-bit 内存 | Tool Calling | 64GB 可跑 |
+|------|-----------|------|-----------|-------------|----------|
+| Qwen3.5-0.8B | 0.8B | Dense | ~0.4GB | 原生 XML | YES |
+| Qwen3.5-2B | 2B | Dense | ~1.1GB | 原生 XML | YES |
+| Qwen3.5-4B | 4B | Dense | ~2.2GB | 原生 XML | YES |
+| Qwen3.5-9B | 9B | Dense | ~5GB | 原生 XML | YES |
+| Qwen3.5-27B | 27B | Dense | ~14GB | 原生 XML | YES |
+| **Qwen3.5-35B-A3B** | **35B/3B** | **MoE** | **~20-24GB** | **原生 XML** | **YES** |
+| Qwen3.5-122B-A10B | 122B/10B | MoE | ~67GB | 原生 XML | TIGHT |
+| Qwen3.5-397B-A17B | 397B/17B | MoE | ~214GB | 原生 XML | NO |
 
-| Parameter | V8 | Lane D | V10 |
-|-----------|-----|--------|-----|
-| Steps | 2000 | 1500 | **5000** |
-| Data coverage | 19.5% | 14.0% | **~35%** |
-| Learning rate | 1e-4 | 1e-4 | 1e-4 |
-| LoRA rank | 64 | 64 | 64 |
-| max_seq_len | 384 | 384 | 384 |
-| Quantize | 4-bit | 4-bit | 4-bit |
-| val_interval | 200 | 200 | **500** |
-| warmup_steps | 100 | 100 | **200** |
-| grad_checkpoint | no | attention-only | **attention-only** |
-| bf16 | no | no | **no** (degrades names) |
-| Length-sorted batching | no | yes | **yes** |
+特点：
+- Gated Delta Networks（线性注意力）+ MoE 架构
+- 原生多模态（视觉+语言）
+- 原生 tool calling（XML 格式）
+- 统一 instruct+base 模型
+- MLX 已支持
 
-### Expected Training Time
+#### Qwen3 Agent 专用
 
-- 5000 steps x ~2.5s/step = ~3.5 hours (+ val overhead ~1h)
-- Total: **~4.5 hours**
+| 模型 | 总参/激活参 | 特点 |
+|------|-----------|------|
+| Qwen3-Coder-30B-A3B-Instruct | 30B/3B | 专为 agentic coding 设计，256K 上下文 |
+| Qwen3-Next-80B-A3B-Instruct | 80B/3B | 长程推理 + 复杂工具使用 |
 
-## Expected Outcomes
+#### 其他竞品
 
-| Metric | V8 | Lane D | V10 Target |
-|--------|-----|--------|------------|
-| BFCL simple_python | 56% | 46% | **50-58%** |
-| Self tool_select | 45.5% | 63.6% | **55-65%** |
-| Names accuracy | 98% | 90% | **92-98%** |
-| no_tool precision | 100% | 80% | **95-100%** |
-| BFCL irrelevance | 8% | 32% | **5-15%** |
-| BFCL OVERALL | 21.2% | 16.8% | **20-25%** |
+| 模型 | 总参/激活参 | 架构 | Tool Calling |
+|------|-----------|------|-------------|
+| Llama 4 Scout | 109B/17B | MoE 16专家 | 原生 pythonic |
+| Llama 4 Maverick | 400B/17B | MoE 128专家 | 原生 pythonic |
+| Ministral-3B/8B/14B | Dense | Dense | 原生 |
+| IBM Granite-20B-FC | 20B | Dense | 专用 FC 模型 |
+| MiMo-V2-Flash | 309B/15B | MoE hybrid SWA/GA | 有（复杂 schema 会幻觉） |
 
-Key hypothesis: more training steps + more xlam diversity will recover V8's simple_python accuracy while keeping Lane D's tool_select improvement.
+#### BFCL 排行榜（2026, V4）
 
-## Implementation Steps
+| 排名 | 模型 | 分数 |
+|------|------|------|
+| ~2 | Claude Opus 4.1 | 70.36% |
+| ~3 | Claude Sonnet 4 | 70.29% |
+| ~7 | GPT-5 | 59.22% |
+| Top open-source | IBM Granite-20B-FC | — |
 
-1. Modify `gen_tool_data.py`: remove `gen_bfcl_style_irrelevance()` and `gen_bfcl_irrelevance_v9()` from `generate_all()`
-2. Modify `combine_data.py`: increase xlam sample to 15k, reduce no-tool ratio to 18%
-3. Run data pipeline: gen_tool_data → clean_xlam → combine
-4. Train with: `--steps 5000 --val-interval 500 --warmup-steps 200 --grad-checkpoint`
-5. Eval with BFCL + self-eval
+---
 
-## Future Directions (Post-V10)
+## 推荐方案
 
-### If V10 succeeds (simple >= 55%, tool_select >= 55%):
+### 阶段一：立即可用（1-2 天）
 
-1. **BFCL format alignment**: Analyze specific argument mismatches in BFCL AST checker. Fix parameter type/default handling.
-2. **Inference-time irrelevance**: Add system prompt instruction "Only call a function if it can directly solve the user's request" instead of training data.
-3. **Rank-128 LoRA**: More parameter capacity for complex patterns.
-4. **Multi-epoch training**: 10k+ steps to see full dataset 1-2 times.
+**接入 Qwen3.5-35B-A3B（MoE，3B 激活）到 Alloy agent 框架**
 
-### If V10 doesn't meet targets:
+- 用 `mlx-lm` 加载 4-bit 量化版（~20-24GB 内存）
+- 改造 `alloy/agent.py` 支持 mlx-lm 后端
+- 使用 Qwen3.5 原生 XML tool calling 格式
+- 保留 Alloy 的工具注册、执行循环、流式输出
 
-1. **Diagnose**: Run verbose eval to identify specific failure patterns.
-2. **BFCL-specific fine-tuning**: Convert more BFCL ground truth to training data (currently only 200 examples from second half).
-3. **DPO for irrelevance**: Train preference model with (correct_call, wrong_call) pairs — avoids the supervised zero-sum problem.
-4. **Separate LoRA adapters**: One for tool-calling, one for irrelevance, merge at inference.
+也可试 **Qwen3-Coder-30B-A3B-Instruct**（专为 agent 设计）。
+
+预期效果：tool calling 开箱即用，质量远超我们训练的 LoRA。
+
+### 阶段二：优化调优（1 周）
+
+1. **Benchmark 对比**：Qwen3.5-9B vs 27B vs 35B-A3B vs Qwen3-Coder-30B-A3B
+2. **LoRA 微调**（可选）：用我们的数据管线微调 Qwen3.5-9B，添加自定义工具
+3. **Agent 框架增强**：多工具并行、错误重试、对话记忆
+
+### 阶段三：Alloy 独特优势（2-4 周，研究方向）
+
+1. **Nemotron-H 继续作为研究项目**：探索 hybrid SSM agent 的能力边界
+2. **投机解码**：Nemotron-H（快速 Mamba）做 draft + Qwen 做 verifier
+3. **长上下文 Agent**：SSM 的 O(L) 内存优势在长对话中不可替代
+
+---
+
+## 技术要点
+
+### Qwen3.5 Tool Calling 格式
+
+Qwen3.5 使用 XML 格式（非 JSON）：
+```xml
+<function=get_weather><parameter=city>Tokyo</parameter><parameter=unit>celsius</parameter></function>
+```
+
+需要适配 Alloy 的 `parse_tool_call()` 来支持这个格式。
+
+### mlx-lm 集成
+
+```bash
+pip install mlx-lm
+# 下载 + 量化
+mlx_lm.convert --hf-path Qwen/Qwen3.5-35B-A3B -q --q-bits 4
+# 或直接用社区量化版
+mlx_lm.generate --model mlx-community/Qwen3.5-35B-A3B-4bit --prompt "..."
+```
+
+### MoE 在 MLX 上的性能
+
+Qwen3.5-35B-A3B：35B 总参但只有 3B 激活 → 推理速度接近 3B dense 模型，但质量接近 35B dense。这是 64GB Mac Mini 的最佳选择。
+
+---
+
+## V8-V9 实验总结（归档）
+
+### 训练结果
+
+| Version | Data | Steps | BFCL simple | Self tool_sel | Irrelevance | Names | Train Time |
+|---------|------|-------|------------|--------------|-------------|-------|------------|
+| V8 | 10.5k | 2000 | **56%** | 45.5% | 8% | **98%** | 16.1h |
+| V9 bf16 | 10.4k | 2000 | 32% | 18.2% | 66% | 74% | 2.2h |
+| V9b fp32 | 10.4k | 2000 | 40% | 36.4% | 50% | 72% | 2.3h |
+| V9c balanced | 10.4k | 2000 | 30% | 36.4% | **72%** | — | 2.3h |
+| V9d Lane D | 10.7k | 1500 | 46% | **63.6%** | 32% | 90% | 1.1h |
+| V9e Lane E | 10.7k | 1500 | 36% | 36.4% | 44% | 90% | 1.1h |
+| V9f Lane F | 10.7k | 1200+300 | 30% | 27.3% | 72% | 72% | 1.5h |
+
+### 关键发现
+
+1. **Irrelevance vs tool-calling 是 zero-sum**：无法在 supervised training 中同时改善
+2. **bf16 LoRA 降低 names accuracy**（98%→74%），不可用于生产
+3. **内存优化 8x 加速**：length-sorted batching + 预清缓存 + attention checkpoint
+4. **严重欠拟合**：模型只看了 14-20% 训练数据
+5. **紧凑 prompt 省 57% tokens**：3x 更多数据进入训练
